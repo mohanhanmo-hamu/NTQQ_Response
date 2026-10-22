@@ -1,0 +1,19 @@
+LIBRARY version
+EXPORTS
+    GetFileVersionInfoA = GetFileVersionInfoA_wrap
+    GetFileVersionInfoByHandle = GetFileVersionInfoByHandle_wrap
+    GetFileVersionInfoExA = GetFileVersionInfoExA_wrap
+    GetFileVersionInfoExW = GetFileVersionInfoExW_wrap
+    GetFileVersionInfoSizeA = GetFileVersionInfoSizeA_wrap
+    GetFileVersionInfoSizeExA = GetFileVersionInfoSizeExA_wrap
+    GetFileVersionInfoSizeExW = GetFileVersionInfoSizeExW_wrap
+    GetFileVersionInfoSizeW = GetFileVersionInfoSizeW_wrap
+    GetFileVersionInfoW = GetFileVersionInfoW_wrap
+    VerFindFileA = VerFindFileA_wrap
+    VerFindFileW = VerFindFileW_wrap
+    VerInstallFileA = VerInstallFileA_wrap
+    VerInstallFileW = VerInstallFileW_wrap
+    VerLanguageNameA = VerLanguageNameA_wrap
+    VerLanguageNameW = VerLanguageNameW_wrap
+    VerQueryValueA = VerQueryValueA_wrap
+    VerQueryValueW = VerQueryValueW_wrap
