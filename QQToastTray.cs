@@ -24,6 +24,9 @@ namespace QQToastTray
         public bool EnableGroupNotify { get; set; }
         public bool MuteWhenQQForeground { get; set; }
         public bool SuppressNativeQQBanner { get; set; }
+        public bool FollowQQStartup { get; set; }
+        public int MaxHistoryLines { get; set; }
+        public int MaxCharsPerLine { get; set; }
         public int LocalPort { get; set; }
 
         public AppConfig()
@@ -32,6 +35,9 @@ namespace QQToastTray
             EnableGroupNotify = true;
             MuteWhenQQForeground = true;
             SuppressNativeQQBanner = true;
+            FollowQQStartup = true;
+            MaxHistoryLines = 3;
+            MaxCharsPerLine = 50;
             LocalPort = 39876;
         }
     }
@@ -46,14 +52,22 @@ namespace QQToastTray
         public string senderName { get; set; }
         public string content { get; set; }
         public string avatarPath { get; set; }
+        public string imagePath { get; set; }
+        public bool isImageUpdate { get; set; }
     }
 
     public class ReplyCommand
     {
         public string id { get; set; }
+        public string action { get; set; } // "reply" or "openChat"
         public int chatType { get; set; }
         public string peerUid { get; set; }
         public string content { get; set; }
+
+        public ReplyCommand()
+        {
+            action = "reply";
+        }
     }
 
     public class ConversationState
@@ -62,6 +76,7 @@ namespace QQToastTray
         public string PeerUid;
         public string PeerName;
         public string AvatarPath;
+        public string ImagePath;
         public List<string> Lines = new List<string>();
         public DateTime LastUpdated = DateTime.Now;
     }
@@ -124,6 +139,8 @@ namespace QQToastTray
         private ToolStripMenuItem _groupItem;
         private ToolStripMenuItem _muteFgItem;
         private ToolStripMenuItem _suppressNativeItem;
+        private ToolStripMenuItem _stackingMenu;
+        private ToolStripMenuItem _followQQItem;
         private ToolStripMenuItem _autoStartItem;
 
         private AppConfig _config;
@@ -146,6 +163,7 @@ namespace QQToastTray
         private readonly Dictionary<string, ConversationState> _conversations = new Dictionary<string, ConversationState>();
         private readonly List<string> _queuedSessionKeys = new List<string>();
         private string _activeBannerSessionKey = null;
+        private string _activeBannerImagePath = null;
         private DateTime _activeBannerShownAt = DateTime.MinValue;
         private string _latestOtherSessionAlert = "";
         private uint _sequenceNumber = 1;
@@ -163,6 +181,12 @@ namespace QQToastTray
 
         [DllImport("user32.dll")]
         private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
 
         [DllImport("ole32.dll")]
         private static extern int CoRegisterClassObject(
@@ -268,7 +292,7 @@ namespace QQToastTray
             _bridgeJsPath = Path.Combine(baseDir, "qq-bridge.js");
             _logPath = Path.Combine(baseDir, "tray-debug.log");
 
-            Log("=== QQToastTray v2 starting ===");
+            Log("=== QQToastTray v1.1.0 starting ===");
             LoadConfig();
             RegisterComActivatorAndAumid();
             InitTray();
@@ -299,6 +323,14 @@ namespace QQToastTray
                     var json = File.ReadAllText(_configPath, Encoding.UTF8);
                     var serializer = new JavaScriptSerializer();
                     _config = serializer.Deserialize<AppConfig>(json) ?? new AppConfig();
+                    if (_config.MaxHistoryLines < 1 || _config.MaxHistoryLines > 4)
+                    {
+                        _config.MaxHistoryLines = 3;
+                    }
+                    if (_config.MaxCharsPerLine <= 0)
+                    {
+                        _config.MaxCharsPerLine = 50;
+                    }
                 }
                 else
                 {
@@ -483,6 +515,67 @@ namespace QQToastTray
                 ApplyNativeQQNotificationSuppression(_config.Enabled && _config.SuppressNativeQQBanner);
             };
 
+            _stackingMenu = new ToolStripMenuItem("消息堆叠与字数上限");
+
+            var line1Item = new ToolStripMenuItem("最多堆叠 1 条 (仅最新)");
+            var line2Item = new ToolStripMenuItem("最多堆叠 2 条");
+            var line3Item = new ToolStripMenuItem("最多堆叠 3 条 (默认)");
+            var line4Item = new ToolStripMenuItem("最多堆叠 4 条");
+            var lineItems = new ToolStripMenuItem[] { line1Item, line2Item, line3Item, line4Item };
+
+            for (int i = 0; i < lineItems.Length; i++)
+            {
+                int linesVal = i + 1;
+                ToolStripMenuItem item = lineItems[i];
+                item.Checked = (_config.MaxHistoryLines == linesVal);
+                item.Click += (s, e) =>
+                {
+                    _config.MaxHistoryLines = linesVal;
+                    for (int j = 0; j < lineItems.Length; j++)
+                    {
+                        lineItems[j].Checked = (j + 1 == linesVal);
+                    }
+                    SaveConfig();
+                };
+                _stackingMenu.DropDownItems.Add(item);
+            }
+
+            _stackingMenu.DropDownItems.Add(new ToolStripSeparator());
+
+            var char30Item = new ToolStripMenuItem("单条上限 30 字 (紧凑)");
+            var char50Item = new ToolStripMenuItem("单条上限 50 字 (默认)");
+            var char80Item = new ToolStripMenuItem("单条上限 80 字 (宽松)");
+            var charItems = new ToolStripMenuItem[] { char30Item, char50Item, char80Item };
+            var charLimits = new int[] { 30, 50, 80 };
+
+            for (int i = 0; i < charItems.Length; i++)
+            {
+                int limitVal = charLimits[i];
+                ToolStripMenuItem item = charItems[i];
+                item.Checked = (_config.MaxCharsPerLine == limitVal);
+                item.Click += (s, e) =>
+                {
+                    _config.MaxCharsPerLine = limitVal;
+                    for (int j = 0; j < charItems.Length; j++)
+                    {
+                        charItems[j].Checked = (charLimits[j] == limitVal);
+                    }
+                    SaveConfig();
+                };
+                _stackingMenu.DropDownItems.Add(item);
+            }
+
+            _followQQItem = new ToolStripMenuItem("跟随 QQ 启动自动运行")
+            {
+                Checked = _config.FollowQQStartup,
+                CheckOnClick = true
+            };
+            _followQQItem.CheckedChanged += (s, e) =>
+            {
+                _config.FollowQQStartup = _followQQItem.Checked;
+                SaveConfig();
+            };
+
             var testItem = new ToolStripMenuItem("发送多条测试通知 (体验打字中实时追加)");
             testItem.Click += (s, e) =>
             {
@@ -539,6 +632,8 @@ namespace QQToastTray
             _menu.Items.Add(_groupItem);
             _menu.Items.Add(_muteFgItem);
             _menu.Items.Add(_suppressNativeItem);
+            _menu.Items.Add(_stackingMenu);
+            _menu.Items.Add(_followQQItem);
             _menu.Items.Add(new ToolStripSeparator());
             _menu.Items.Add(testItem);
             _menu.Items.Add(injectAndRestartQQItem);
@@ -550,7 +645,7 @@ namespace QQToastTray
             _trayIcon = new NotifyIcon
             {
                 Icon = CreateModernTrayIcon(_config.Enabled),
-                Text = "QQ Win11 快捷回复助手",
+                Text = "QQ Win11 快捷回复助手 v1.1.0",
                 ContextMenuStrip = _menu,
                 Visible = true
             };
@@ -590,12 +685,12 @@ namespace QQToastTray
             if (connected)
             {
                 _statusItem.Text = "🟢 状态: 已连接 NTQQ 内核 (免打扰过滤已生效)";
-                _trayIcon.Text = "QQ Win11 快捷回复助手 (已连接)";
+                _trayIcon.Text = "QQ Win11 快捷回复助手 v1.1.0 (已连接)";
             }
             else
             {
                 _statusItem.Text = "🟡 状态: 等待 QQ 桥接连接";
-                _trayIcon.Text = "QQ Win11 快捷回复助手 (等待QQ连接)";
+                _trayIcon.Text = "QQ Win11 快捷回复助手 v1.1.0 (等待QQ连接)";
             }
         }
 
@@ -817,6 +912,88 @@ namespace QQToastTray
             }
         }
 
+        private string PrepareToastImageUri(string rawPath)
+        {
+            if (string.IsNullOrEmpty(rawPath) || !File.Exists(rawPath)) return "";
+            try
+            {
+                string cacheDir = Path.Combine(Path.GetTempPath(), "QQToastAvatars");
+                if (!Directory.Exists(cacheDir)) Directory.CreateDirectory(cacheDir);
+
+                string ext = Path.GetExtension(rawPath);
+                if (string.IsNullOrEmpty(ext)) ext = ".jpg";
+
+                int hash = rawPath.GetHashCode();
+                string cachedImg = Path.Combine(cacheDir, "img_" + Math.Abs(hash) + ext);
+
+                FileInfo fi = new FileInfo(rawPath);
+                if (!File.Exists(cachedImg) || new FileInfo(cachedImg).Length != fi.Length)
+                {
+                    File.Copy(rawPath, cachedImg, true);
+                }
+                return new Uri(cachedImg).AbsoluteUri;
+            }
+            catch (Exception ex)
+            {
+                Log("PrepareToastImageUri error: " + ex.Message);
+                return "";
+            }
+        }
+
+        private string BuildHistoryBodyText(ConversationState conv)
+        {
+            if (conv == null || conv.Lines == null || conv.Lines.Count == 0) return "";
+
+            int maxLines = _config.MaxHistoryLines;
+            if (maxLines < 1) maxLines = 1;
+            if (maxLines > 4) maxLines = 4;
+
+            int maxChars = _config.MaxCharsPerLine;
+            if (maxChars <= 0) maxChars = 50;
+
+            int olderLimit = Math.Min(26, maxChars);
+            int totalCharLimit = 110;
+
+            // When inline image thumbnail is present, available text area is restricted, cap at 2 lines and 65 chars
+            if (!string.IsNullOrEmpty(conv.ImagePath))
+            {
+                maxLines = Math.Min(maxLines, 2);
+                totalCharLimit = 65;
+            }
+
+            int lastIdx = conv.Lines.Count - 1;
+            string latestRaw = conv.Lines[lastIdx] ?? "";
+            string latestFormatted = latestRaw;
+            if (latestFormatted.Length > maxChars)
+            {
+                latestFormatted = latestFormatted.Substring(0, Math.Max(0, maxChars - 3)) + "...";
+            }
+
+            List<string> selected = new List<string>();
+            selected.Add(latestFormatted);
+            int totalChars = latestFormatted.Length;
+
+            for (int i = lastIdx - 1; i >= 0 && selected.Count < maxLines; i--)
+            {
+                string olderRaw = conv.Lines[i] ?? "";
+                string olderFormatted = olderRaw;
+                if (olderFormatted.Length > olderLimit)
+                {
+                    olderFormatted = olderFormatted.Substring(0, Math.Max(0, olderLimit - 3)) + "...";
+                }
+
+                if (totalChars + olderFormatted.Length > totalCharLimit)
+                {
+                    break;
+                }
+
+                selected.Insert(0, olderFormatted);
+                totalChars += olderFormatted.Length;
+            }
+
+            return string.Join("\n", selected.ToArray());
+        }
+
         public void ShowQuickReplyToast(IncomingMessage msg)
         {
             if (!_config.Enabled) return;
@@ -838,17 +1015,41 @@ namespace QQToastTray
             try
             {
                 string sessionKey = msg.chatType + ":" + (msg.peerUid ?? "");
+
+                if (msg.isImageUpdate)
+                {
+                    lock (_toastLock)
+                    {
+                        ConversationState c;
+                        if (_conversations.TryGetValue(sessionKey, out c))
+                        {
+                            if (!string.IsNullOrEmpty(msg.imagePath) && File.Exists(msg.imagePath))
+                            {
+                                c.ImagePath = msg.imagePath;
+                                if (_activeBannerSessionKey == sessionKey)
+                                {
+                                    ShowBannerForConversation(sessionKey, c);
+                                    Log("Refreshed active banner with async image for " + c.PeerName);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+
                 string title = msg.chatType == 2
                     ? (string.IsNullOrEmpty(msg.peerName) ? "群聊消息" : msg.peerName)
                     : (string.IsNullOrEmpty(msg.senderName) ? "QQ 好友" : msg.senderName);
 
+                string cleanContent = (msg.content ?? "").Replace("\r\n", " ").Replace("\r", " ").Replace("\n", " ");
+
                 string lineText = msg.chatType == 2 && !string.IsNullOrEmpty(msg.senderName)
-                    ? (msg.senderName + ": " + msg.content)
-                    : ("▸ " + msg.content);
+                    ? (msg.senderName + ": " + cleanContent)
+                    : ("▸ " + cleanContent);
 
                 lock (_toastLock)
                 {
-                    // 1. Update conversation history buffer (keep up to 4 latest lines)
+                    // 1. Update conversation history buffer
                     ConversationState conv;
                     if (!_conversations.TryGetValue(sessionKey, out conv))
                     {
@@ -857,7 +1058,8 @@ namespace QQToastTray
                             ChatType = msg.chatType,
                             PeerUid = msg.peerUid,
                             PeerName = title,
-                            AvatarPath = msg.avatarPath
+                            AvatarPath = msg.avatarPath,
+                            ImagePath = (!string.IsNullOrEmpty(msg.imagePath) && File.Exists(msg.imagePath)) ? msg.imagePath : null
                         };
                         _conversations[sessionKey] = conv;
                     }
@@ -865,16 +1067,27 @@ namespace QQToastTray
                     {
                         if (!string.IsNullOrEmpty(title) && title != "QQ好友" && title != "QQ 好友") conv.PeerName = title;
                         if (!string.IsNullOrEmpty(msg.avatarPath)) conv.AvatarPath = msg.avatarPath;
+
+                        if (!string.IsNullOrEmpty(msg.imagePath) && File.Exists(msg.imagePath))
+                        {
+                            conv.ImagePath = msg.imagePath;
+                        }
+                        else if (_activeBannerSessionKey != sessionKey)
+                        {
+                            conv.ImagePath = null;
+                        }
+
                         // Clear old lines if last message was more than 5 minutes ago
                         if ((DateTime.Now - conv.LastUpdated).TotalMinutes > 5)
                         {
                             conv.Lines.Clear();
+                            conv.ImagePath = (!string.IsNullOrEmpty(msg.imagePath) && File.Exists(msg.imagePath)) ? msg.imagePath : null;
                         }
                     }
 
                     conv.LastUpdated = DateTime.Now;
                     conv.Lines.Add(lineText);
-                    while (conv.Lines.Count > 4)
+                    while (conv.Lines.Count > 10)
                     {
                         conv.Lines.RemoveAt(0);
                     }
@@ -884,6 +1097,14 @@ namespace QQToastTray
                     {
                         if (_activeBannerSessionKey == sessionKey)
                         {
+                            // If image state changed on active banner, ToastNotifier.Update cannot dynamically insert <image> into XML!
+                            // So re-show the banner to smoothly render the image thumbnail!
+                            if (conv.ImagePath != _activeBannerImagePath)
+                            {
+                                ShowBannerForConversation(sessionKey, conv);
+                                return;
+                            }
+
                             // Same conversation! Update in-place without recreating Toast so user's typing input is NEVER interrupted!
                             if (TryUpdateLiveBannerInPlace(conv))
                             {
@@ -898,7 +1119,7 @@ namespace QQToastTray
                             ConversationState activeConv;
                             if (_conversations.TryGetValue(_activeBannerSessionKey, out activeConv))
                             {
-                                string preview = msg.content ?? "";
+                                string preview = cleanContent;
                                 if (preview.Length > 22) preview = preview.Substring(0, 22) + "...";
                                 _latestOtherSessionAlert = "📩 [" + conv.PeerName + "] " + preview;
                                 if (!_queuedSessionKeys.Contains(sessionKey))
@@ -935,7 +1156,7 @@ namespace QQToastTray
                 headerTitle = conv.PeerName + "  |  " + _latestOtherSessionAlert;
             }
 
-            string bodyHistory = string.Join("\n", conv.Lines.ToArray());
+            string bodyHistory = BuildHistoryBodyText(conv);
 
             data.Values["title"] = headerTitle;
             data.Values["bodyHistory"] = bodyHistory;
@@ -962,6 +1183,7 @@ namespace QQToastTray
             try
             {
                 _activeBannerSessionKey = sessionKey;
+                _activeBannerImagePath = conv.ImagePath;
                 _activeBannerShownAt = DateTime.Now;
                 _latestOtherSessionAlert = "";
                 _queuedSessionKeys.Remove(sessionKey);
@@ -973,23 +1195,35 @@ namespace QQToastTray
                     imageTag = "<image placement=\"appLogoOverride\" hint-crop=\"circle\" src=\"" + EscapeXml(fileUri) + "\"/>";
                 }
 
+                string inlineImageTag = "";
+                if (!string.IsNullOrEmpty(conv.ImagePath))
+                {
+                    string imgUri = PrepareToastImageUri(conv.ImagePath);
+                    if (!string.IsNullOrEmpty(imgUri))
+                    {
+                        inlineImageTag = "<image placement=\"inline\" src=\"" + EscapeXml(imgUri) + "\"/>";
+                    }
+                }
+
                 string token = Guid.NewGuid().ToString("N").Substring(0, 8);
-                string argsString = "action=reply&token=" + token + "&chatType=" + conv.ChatType + "&peerUid=" + Uri.EscapeDataString(conv.PeerUid ?? "");
+                string launchArgs = "action=toastClick&token=" + token + "&chatType=" + conv.ChatType + "&peerUid=" + Uri.EscapeDataString(conv.PeerUid ?? "");
+                string actionArgs = "action=reply&token=" + token + "&chatType=" + conv.ChatType + "&peerUid=" + Uri.EscapeDataString(conv.PeerUid ?? "");
 
                 // Use Windows 10/11 Native Data Binding placeholders {title} and {bodyHistory}
                 // so subsequent ToastNotifier.Update() calls dynamically append messages above the input box without resetting focus!
                 string xmlString =
-                    "<toast launch=\"" + EscapeXml(argsString) + "\">" +
+                    "<toast launch=\"" + EscapeXml(launchArgs) + "\">" +
                         "<visual>" +
                             "<binding template=\"ToastGeneric\">" +
                                 "<text>{title}</text>" +
                                 "<text>{bodyHistory}</text>" +
                                 imageTag +
+                                inlineImageTag +
                             "</binding>" +
                         "</visual>" +
                         "<actions>" +
                             "<input id=\"replyText\" type=\"text\" placeHolderContent=\"直接回复 " + EscapeXml(conv.PeerName) + "...\" />" +
-                            "<action content=\"发送\" arguments=\"" + EscapeXml(argsString) + "\" hint-inputId=\"replyText\" />" +
+                            "<action content=\"发送\" arguments=\"" + EscapeXml(actionArgs) + "\" hint-inputId=\"replyText\" />" +
                         "</actions>" +
                     "</toast>";
 
@@ -1012,7 +1246,7 @@ namespace QQToastTray
                 }
 
                 ToastNotificationManager.CreateToastNotifier(_activeAumid).Show(toast);
-                Log("Toast banner shown for " + conv.PeerName + " (lines=" + conv.Lines.Count + ")");
+                Log("Toast banner shown for " + conv.PeerName + " (lines=" + conv.Lines.Count + ", img=" + (!string.IsNullOrEmpty(conv.ImagePath) ? "yes" : "no") + ")");
             }
             catch (Exception ex)
             {
@@ -1039,7 +1273,13 @@ namespace QQToastTray
                 if (_activeBannerSessionKey == closedSessionKey)
                 {
                     _activeBannerSessionKey = null;
+                    _activeBannerImagePath = null;
                     _latestOtherSessionAlert = "";
+                }
+                ConversationState conv;
+                if (_conversations.TryGetValue(closedSessionKey, out conv))
+                {
+                    conv.ImagePath = null;
                 }
                 PopNextQueuedSessionIfAny();
             }
@@ -1120,6 +1360,7 @@ namespace QQToastTray
         {
             try
             {
+                string action = "";
                 int chatType = 1;
                 string peerUid = "";
                 string token = "";
@@ -1128,6 +1369,7 @@ namespace QQToastTray
                     var kv = part.Split('=');
                     if (kv.Length == 2)
                     {
+                        if (kv[0] == "action") action = kv[1];
                         if (kv[0] == "chatType") int.TryParse(kv[1], out chatType);
                         if (kv[0] == "peerUid") peerUid = Uri.UnescapeDataString(kv[1]);
                         if (kv[0] == "token") token = kv[1];
@@ -1136,23 +1378,7 @@ namespace QQToastTray
 
                 string sessionKey = chatType + ":" + peerUid;
 
-                if (string.IsNullOrWhiteSpace(replyText))
-                {
-                    Log("Toast clicked without replyText (" + source + ").");
-                    if (_uiContext != null)
-                    {
-                        _uiContext.Post(_ =>
-                        {
-                            lock (_toastLock)
-                            {
-                                _activeBannerSessionKey = null;
-                                PopNextQueuedSessionIfAny();
-                            }
-                        }, null);
-                    }
-                    return;
-                }
-
+                // Move token deduplication BEFORE isToastClick check so toastClick is also deduped!
                 lock (_queueLock)
                 {
                     if (!string.IsNullOrEmpty(token))
@@ -1163,6 +1389,64 @@ namespace QQToastTray
                         }
                         _processedReplyTokens.Add(token);
                     }
+                }
+
+                bool isToastClick = (action == "toastClick") || (string.IsNullOrWhiteSpace(replyText) && (action == "reply" || string.IsNullOrEmpty(action)));
+
+                if (isToastClick)
+                {
+                    Log("Toast clicked without replyText / toastClick (" + source + ") for peerUid=" + peerUid + ", chatType=" + chatType + ". Activating QQ main window.");
+
+                    // 1. Win32: Find QQ main window handle, restore and bring to foreground
+                    try
+                    {
+                        foreach (var proc in Process.GetProcessesByName("QQ"))
+                        {
+                            IntPtr hWnd = proc.MainWindowHandle;
+                            if (hWnd != IntPtr.Zero)
+                            {
+                                ShowWindow(hWnd, 9 /* SW_RESTORE */);
+                                SetForegroundWindow(hWnd);
+                                break;
+                            }
+                        }
+                    }
+                    catch (Exception exHwnd)
+                    {
+                        Log("SetForegroundWindow notice: " + exHwnd.Message);
+                    }
+
+                    // 2. Dispatch openChat command to bridge for NTQQ in-app chat jump
+                    if (!string.IsNullOrEmpty(peerUid))
+                    {
+                        lock (_queueLock)
+                        {
+                            _pendingReplies.Add(new ReplyCommand
+                            {
+                                id = "open_" + DateTime.Now.Ticks,
+                                action = "openChat",
+                                chatType = chatType,
+                                peerUid = peerUid,
+                                content = ""
+                            });
+                        }
+                    }
+
+                    // 3. Clear active banner
+                    if (_uiContext != null)
+                    {
+                        _uiContext.Post(_ =>
+                        {
+                            lock (_toastLock)
+                            {
+                                _activeBannerSessionKey = null;
+                                _activeBannerImagePath = null;
+                                _latestOtherSessionAlert = "";
+                                PopNextQueuedSessionIfAny();
+                            }
+                        }, null);
+                    }
+                    return;
                 }
 
                 Log("Captured quick reply via " + source + "! peerUid=" + peerUid + ", chatType=" + chatType + ", text=" + replyText);
@@ -1178,8 +1462,10 @@ namespace QQToastTray
                             if (_conversations.TryGetValue(sessionKey, out conv))
                             {
                                 conv.Lines.Clear();
+                                conv.ImagePath = null;
                             }
                             _activeBannerSessionKey = null;
+                            _activeBannerImagePath = null;
                             _latestOtherSessionAlert = "";
                             PopNextQueuedSessionIfAny();
                         }
@@ -1199,6 +1485,7 @@ namespace QQToastTray
                         _pendingReplies.Add(new ReplyCommand
                         {
                             id = Guid.NewGuid().ToString("N"),
+                            action = "reply",
                             chatType = chatType,
                             peerUid = peerUid,
                             content = replyText

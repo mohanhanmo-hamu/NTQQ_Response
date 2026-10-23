@@ -50,6 +50,65 @@
     const avatarPathCache = new Map();  // uid/peerUid -> local file path
     const dndPeerMap = new Map();       // peerUid -> boolean (true if DND/muted)
 
+    let loggedSamplePicElement = false;
+
+    function findValidLocalPath(pic) {
+      if (!pic) return '';
+      if (pic.sourcePath && typeof pic.sourcePath === 'string' && fs.existsSync(pic.sourcePath)) {
+        try {
+          if (fs.statSync(pic.sourcePath).size > 0) return pic.sourcePath;
+        } catch (e) {}
+      }
+      if (pic.thumbPath) {
+        let values = [];
+        if (pic.thumbPath instanceof Map) {
+          values = Array.from(pic.thumbPath.values());
+        } else if (typeof pic.thumbPath === 'object') {
+          values = Object.values(pic.thumbPath);
+        }
+        for (const p of values) {
+          if (p && typeof p === 'string' && fs.existsSync(p)) {
+            try {
+              if (fs.statSync(p).size > 0) return p;
+            } catch (e) {}
+          }
+        }
+      }
+      return '';
+    }
+
+    async function extractImagePath(picElement, msg, el) {
+      if (!picElement) return '';
+      let p = findValidLocalPath(picElement);
+      if (p) return p;
+
+      if (msgServiceInstance && typeof msgServiceInstance.downloadRichMedia === 'function') {
+        try {
+          msgServiceInstance.downloadRichMedia({
+            peerUid: String(msg.peerUid || ''),
+            chatType: Number(msg.chatType || 1),
+            msgId: String(msg.msgId || '0'),
+            elementId: String((el && el.elementId) || '0'),
+            downloadType: 2, // 2 = thumb, 1 = original
+            thumbSize: 0,
+            filePath: '',
+            fileModelId: '0',
+            downSourceType: 0,
+            triggerType: 1
+          });
+        } catch (err) {
+          log('downloadRichMedia error:', err.message);
+        }
+
+        for (let i = 0; i < 4; i++) {
+          await new Promise((resolve) => setTimeout(resolve, 150));
+          p = findValidLocalPath(picElement);
+          if (p) return p;
+        }
+      }
+      return '';
+    }
+
     function postToTray(endpoint, payload) {
       try {
         const data = Buffer.from(JSON.stringify(payload), 'utf8');
@@ -246,7 +305,35 @@
             }
           } catch (e) {}
 
-          log(`Notify msg (${sourceTag}) [chatType=${chatType}, atMe=${isAtMe}] from ${senderName} (peer=${peerName}, uid=${peerUid}): ${content}`);
+          let imagePath = '';
+          let pendingPicEl = null;
+          if (Array.isArray(msg.elements)) {
+            for (const el of msg.elements) {
+              if (el && el.picElement) {
+                if (!loggedSamplePicElement) {
+                  loggedSamplePicElement = true;
+                  try {
+                    const picCopy = {};
+                    for (const k of Object.keys(el.picElement)) {
+                      const v = el.picElement[k];
+                      if (Buffer.isBuffer(v)) picCopy[k] = `<Buffer ${v.length}>`;
+                      else if (v instanceof Map) picCopy[k] = `Map(${v.size})`;
+                      else picCopy[k] = v;
+                    }
+                    log('Sample picElement structure:', picCopy);
+                  } catch (e) {}
+                }
+                imagePath = await extractImagePath(el.picElement, msg, el);
+                if (imagePath) {
+                  break;
+                } else {
+                  pendingPicEl = el;
+                }
+              }
+            }
+          }
+
+          log(`Notify msg (${sourceTag}) [chatType=${chatType}, atMe=${isAtMe}] from ${senderName} (peer=${peerName}, uid=${peerUid}, img=${imagePath ? 'yes' : 'no'}): ${content}`);
 
           postToTray('/notify', {
             msgId: msgIdStr,
@@ -256,8 +343,43 @@
             senderUid: String(msg.senderUid || ''),
             senderName: senderName,
             content: isAtMe && !content.startsWith('[有人@我]') ? `[有人@我] ${content}` : content,
-            avatarPath: String(avatarPath || '')
+            avatarPath: String(avatarPath || ''),
+            imagePath: String(imagePath || ''),
+            isImageUpdate: false
           });
+
+          // Background async retry for real QQ image downloading (if > 600ms)
+          if (!imagePath && pendingPicEl && pendingPicEl.picElement) {
+            const targetPicEl = pendingPicEl.picElement;
+            let checkCount = 0;
+            const maxChecks = 6;
+            const timer = setInterval(() => {
+              checkCount++;
+              try {
+                const asyncPath = findValidLocalPath(targetPicEl);
+                if (asyncPath) {
+                  clearInterval(timer);
+                  log(`Async image downloaded for ${msgIdStr}: ${asyncPath}`);
+                  postToTray('/notify', {
+                    msgId: msgIdStr,
+                    chatType: chatType,
+                    peerUid: peerUid,
+                    peerName: peerName,
+                    senderUid: String(msg.senderUid || ''),
+                    senderName: senderName,
+                    content: '',
+                    avatarPath: String(avatarPath || ''),
+                    imagePath: asyncPath,
+                    isImageUpdate: true
+                  });
+                  return;
+                }
+              } catch (e) {}
+              if (checkCount >= maxChecks) {
+                clearInterval(timer);
+              }
+            }, 400);
+          }
         } catch (err) {
           log('Error handling msg item:', err.message);
         }
@@ -273,6 +395,24 @@
           },
           onRecvActiveMsg(msgList) {
             handleIncomingMsgList(msgList, 'Kernel.onRecvActiveMsg', true);
+          },
+          onRichMediaDownloadComplete(notifyInfo) {
+            try {
+              if (notifyInfo && notifyInfo.filePath && fs.existsSync(notifyInfo.filePath)) {
+                postToTray('/notify', {
+                  msgId: String(notifyInfo.msgId || ''),
+                  chatType: Number(notifyInfo.chatType || 1),
+                  peerUid: String(notifyInfo.peerUid || ''),
+                  peerName: '',
+                  senderUid: '',
+                  senderName: '',
+                  content: '',
+                  avatarPath: '',
+                  imagePath: notifyInfo.filePath,
+                  isImageUpdate: true
+                });
+              }
+            } catch (e) {}
           }
         };
         keptListenerRef = new Proxy(rawTarget, {
@@ -559,6 +699,24 @@
         if (Array.isArray(msgList)) {
           handleIncomingMsgList(msgList, 'IPC:' + cmd, false);
         }
+      } else if (cmd.includes('onRichMediaDownloadComplete')) {
+        try {
+          const info = (payload && payload[0]) || payload;
+          if (info && info.filePath && fs.existsSync(info.filePath)) {
+            postToTray('/notify', {
+              msgId: String(info.msgId || ''),
+              chatType: Number(info.chatType || 1),
+              peerUid: String(info.peerUid || ''),
+              peerName: '',
+              senderUid: '',
+              senderName: '',
+              content: '',
+              avatarPath: '',
+              imagePath: info.filePath,
+              isImageUpdate: true
+            });
+          }
+        } catch (e) {}
       }
     }
 
@@ -620,6 +778,93 @@
       return exported;
     };
 
+    function handleOpenChat(item) {
+      log('Handling openChat for peerUid=' + item.peerUid + ', chatType=' + item.chatType);
+      try {
+        let electron = null;
+        try { electron = require('electron'); } catch (e) {}
+        if (electron && electron.BrowserWindow && typeof electron.BrowserWindow.getAllWindows === 'function') {
+          const windows = electron.BrowserWindow.getAllWindows();
+          for (const win of windows) {
+            if (!win || win.isDestroyed()) continue;
+            const bounds = win.getBounds ? win.getBounds() : { width: 0, height: 0 };
+            const title = (win.getTitle ? win.getTitle() : '') || '';
+            if (title === 'QQ' || (bounds.width > 400 && bounds.height > 400)) {
+              if (win.isMinimized && win.isMinimized()) win.restore();
+              if (win.show) win.show();
+              if (win.setAlwaysOnTop) {
+                win.setAlwaysOnTop(true);
+                setTimeout(() => { try { if (!win.isDestroyed()) win.setAlwaysOnTop(false); } catch (e) {} }, 300);
+              }
+              if (win.focus) win.focus();
+              break;
+            }
+          }
+        }
+      } catch (eWin) {
+        log('handleOpenChat wake window error:', eWin.message);
+      }
+
+      try {
+        if (recentContactServiceInstance) {
+          const jumpParam = {
+            chatType: Number(item.chatType || 1),
+            peerUid: String(item.peerUid || ''),
+            guildId: ''
+          };
+          if (typeof recentContactServiceInstance.jumpToSpecifyRecentContact === 'function') {
+            recentContactServiceInstance.jumpToSpecifyRecentContact(jumpParam);
+            log('Called jumpToSpecifyRecentContact successfully');
+          } else if (typeof recentContactServiceInstance.jumpToSpecifyRecentContactVer2 === 'function') {
+            recentContactServiceInstance.jumpToSpecifyRecentContactVer2(jumpParam);
+            log('Called jumpToSpecifyRecentContactVer2 successfully');
+          }
+        }
+      } catch (eJump) {
+        log('handleOpenChat jump error:', eJump.message);
+      }
+    }
+
+    let consecutivePollFails = 0;
+    let lastTrayLaunchAttemptMs = 0;
+
+    function tryAutoLaunchTray() {
+      try {
+        const now = Date.now();
+        if (now - lastTrayLaunchAttemptMs < 15000) {
+          return;
+        }
+        lastTrayLaunchAttemptMs = now;
+
+        let follow = true;
+        const configPath = path.join(__dirname, 'config.json');
+        if (fs.existsSync(configPath)) {
+          try {
+            const raw = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+            if (raw && raw.FollowQQStartup === false) {
+              follow = false;
+            }
+          } catch (e) {}
+        }
+        if (!follow) return;
+
+        const trayExePath = path.join(__dirname, 'QQToastTray.exe');
+        if (fs.existsSync(trayExePath)) {
+          log('QQToastTray not responding, auto-launching QQToastTray.exe...');
+          const child_process = require('child_process');
+          const cp = child_process.spawn(trayExePath, [], {
+            cwd: __dirname,
+            detached: true,
+            stdio: 'ignore',
+            windowsHide: false
+          });
+          cp.unref();
+        }
+      } catch (e) {
+        log('tryAutoLaunchTray error:', e.message);
+      }
+    }
+
     let pollTicks = 0;
     setInterval(() => {
       try {
@@ -641,6 +886,7 @@
           path: '/poll',
           timeout: 1500
         }, (res) => {
+          consecutivePollFails = 0;
           lastTrayAliveMs = Date.now();
           let raw = '';
           res.setEncoding('utf8');
@@ -650,13 +896,22 @@
               const data = JSON.parse(raw);
               if (data && Array.isArray(data.replies) && data.replies.length > 0) {
                 for (const item of data.replies) {
-                  sendReplyMessage(item.chatType, item.peerUid, item.content);
+                  if (item.action === 'openChat') {
+                    handleOpenChat(item);
+                  } else {
+                    sendReplyMessage(item.chatType, item.peerUid, item.content);
+                  }
                 }
               }
             } catch (e) {}
           });
         });
-        req.on('error', () => {});
+        req.on('error', () => {
+          consecutivePollFails++;
+          if (consecutivePollFails >= 2) {
+            tryAutoLaunchTray();
+          }
+        });
       } catch (e) {}
     }, 1000);
 
