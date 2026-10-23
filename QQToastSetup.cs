@@ -23,7 +23,7 @@ namespace QQToastSetup
 
         public SetupForm()
         {
-            Text = "QQ Win11 快捷回复助手 - 安装与卸载向导";
+            Text = "QQ Win11 快捷回复助手 v1.1.0 - 安装与卸载向导";
             Size = new Size(520, 390);
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -43,7 +43,7 @@ namespace QQToastSetup
                 using (Brush whiteBrush = new SolidBrush(Color.White))
                 using (Brush subBrush = new SolidBrush(Color.FromArgb(225, 240, 255)))
                 {
-                    e.Graphics.DrawString("QQ Win11 系统级快捷回复助手", titleFont, whiteBrush, 22, 14);
+                    e.Graphics.DrawString("QQ Win11 系统级快捷回复助手 v1.1.0", titleFont, whiteBrush, 22, 14);
                     e.Graphics.DrawString("无需打开 QQ 主窗口，直接在系统通知横幅内打字回复、实时追加新消息", subFont, subBrush, 24, 45);
                 }
             };
@@ -230,7 +230,7 @@ namespace QQToastSetup
                 ExtractResource("qq-bridge.js", bridgeJsPath);
 
                 string configJson = string.Format(
-                    "{{\"Enabled\":true,\"EnableGroupNotify\":true,\"MuteWhenQQForeground\":true,\"SuppressNativeQQBanner\":{0},\"LocalPort\":39876}}",
+                    "{{\"Enabled\":true,\"EnableGroupNotify\":true,\"MuteWhenQQForeground\":true,\"SuppressNativeQQBanner\":{0},\"FollowQQStartup\":true,\"MaxHistoryLines\":3,\"MaxCharsPerLine\":50,\"LocalPort\":39876}}",
                     _chkSuppressNative.Checked ? "true" : "false");
                 File.WriteAllText(configPath, configJson, Encoding.UTF8);
 
