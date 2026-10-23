@@ -1,6 +1,7 @@
 # Debug logs and runtime user config (contain private chat logs)
 *.log
 config.json
+tray-exit.flag
 Temp/
 .vs/
 *.pdb

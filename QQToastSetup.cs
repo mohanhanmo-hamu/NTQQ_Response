@@ -23,7 +23,7 @@ namespace QQToastSetup
 
         public SetupForm()
         {
-            Text = "QQ Win11 快捷回复助手 v1.1.0 - 安装与卸载向导";
+            Text = "QQ Win11 快捷回复助手 v1.1.1 - 安装与卸载向导";
             Size = new Size(520, 390);
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -43,7 +43,7 @@ namespace QQToastSetup
                 using (Brush whiteBrush = new SolidBrush(Color.White))
                 using (Brush subBrush = new SolidBrush(Color.FromArgb(225, 240, 255)))
                 {
-                    e.Graphics.DrawString("QQ Win11 系统级快捷回复助手 v1.1.0", titleFont, whiteBrush, 22, 14);
+                    e.Graphics.DrawString("QQ Win11 系统级快捷回复助手 v1.1.1", titleFont, whiteBrush, 22, 14);
                     e.Graphics.DrawString("无需打开 QQ 主窗口，直接在系统通知横幅内打字回复、实时追加新消息", subFont, subBrush, 24, 45);
                 }
             };
@@ -135,19 +135,25 @@ namespace QQToastSetup
 
         private string DetectQQInstallRoot()
         {
-            try
+            string[] subKeys = new string[]
             {
-                using (var key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\WOW6432Node\Tencent\QQNT", false))
+                @"SOFTWARE\WOW6432Node\Tencent\QQNT",
+                @"SOFTWARE\Tencent\QQNT"
+            };
+            foreach (string subKey in subKeys)
+            {
+                try
                 {
-                    if (key != null)
+                    using (var key = Registry.LocalMachine.OpenSubKey(subKey, false))
                     {
+                        if (key == null) continue;
                         var val = key.GetValue("Install") as string;
                         if (!string.IsNullOrEmpty(val) && Directory.Exists(val))
                             return val;
                     }
                 }
+                catch { }
             }
-            catch { }
             return @"C:\Program Files\Tencent\QQNT";
         }
 
@@ -185,6 +191,83 @@ namespace QQToastSetup
             }
         }
 
+        private static void WriteExitFlag(string installDir)
+        {
+            try
+            {
+                if (!Directory.Exists(installDir)) Directory.CreateDirectory(installDir);
+                long ms = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds;
+                File.WriteAllText(Path.Combine(installDir, "tray-exit.flag"), ms.ToString(), new UTF8Encoding(false));
+            }
+            catch { }
+        }
+
+        private static void ClearExitFlag(string installDir)
+        {
+            try
+            {
+                string flag = Path.Combine(installDir, "tray-exit.flag");
+                if (File.Exists(flag)) File.Delete(flag);
+            }
+            catch { }
+        }
+
+        // 优先请求托盘程序优雅退出（--exit），再兜底结束残留进程。
+        private static void StopTrayProcesses(string installDir)
+        {
+            try
+            {
+                string installedExe = Path.Combine(installDir, "QQToastTray.exe");
+                string signalExe = null;
+                if (File.Exists(installedExe))
+                {
+                    signalExe = installedExe;
+                }
+                else
+                {
+                    foreach (var p in Process.GetProcessesByName("QQToastTray"))
+                    {
+                        try
+                        {
+                            string path = p.MainModule != null ? p.MainModule.FileName : null;
+                            if (!string.IsNullOrEmpty(path) && File.Exists(path)) { signalExe = path; break; }
+                        }
+                        catch { }
+                    }
+                }
+                if (signalExe != null)
+                {
+                    try
+                    {
+                        Process.Start(new ProcessStartInfo
+                        {
+                            FileName = signalExe,
+                            Arguments = "--exit",
+                            UseShellExecute = false,
+                            CreateNoWindow = true,
+                            WorkingDirectory = Path.GetDirectoryName(signalExe)
+                        });
+                    }
+                    catch { }
+                    Thread.Sleep(1000);
+                }
+            }
+            catch { }
+
+            foreach (var p in Process.GetProcessesByName("QQToastTray"))
+            {
+                try { p.Kill(); p.WaitForExit(2000); } catch { }
+            }
+        }
+
+        private static void KillQQProcesses()
+        {
+            foreach (var p in Process.GetProcessesByName("QQ"))
+            {
+                try { p.Kill(); p.WaitForExit(3000); } catch { }
+            }
+        }
+
         private void DoInstall()
         {
             string qqRoot = _qqPathBox.Text.Trim();
@@ -195,44 +278,61 @@ namespace QQToastSetup
                 return;
             }
 
+            string installDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "QQToastTray");
+            string trayExePath = Path.Combine(installDir, "QQToastTray.exe");
+            string dllPath = Path.Combine(installDir, "version.dll");
+            string bridgeJsPath = Path.Combine(installDir, "qq-bridge.js");
+            string configPath = Path.Combine(installDir, "config.json");
+
             try
             {
                 _btnInstall.Enabled = false;
                 _btnUninstall.Enabled = false;
-                _statusLabel.Text = "正在停止旧版进程并释放文件...";
+
+                // 1) 先把“用户主动退出”标记写好，避免 QQ 里的旧桥接进程在
+                //    我们替换文件期间又把旧托盘拉起来（这是旧版安装不干净的原因之一）。
+                if (!Directory.Exists(installDir)) Directory.CreateDirectory(installDir);
+                WriteExitFlag(installDir);
+
+                _statusLabel.Text = "正在停止旧版托盘与 QQ 进程...";
                 Application.DoEvents();
 
-                foreach (var p in Process.GetProcessesByName("QQToastTray"))
-                {
-                    try { p.Kill(); p.WaitForExit(2000); } catch { }
-                }
+                StopTrayProcesses(installDir);
 
-                if (_chkRestartQQ.Checked)
+                if (Process.GetProcessesByName("QQ").Length > 0)
                 {
-                    foreach (var p in Process.GetProcessesByName("QQ"))
+                    if (!_chkRestartQQ.Checked)
                     {
-                        try { p.Kill(); p.WaitForExit(3000); } catch { }
+                        DialogResult answer = MessageBox.Show(
+                            "安装桥接组件需要先关闭 QQ。\n\n是否现在关闭 QQ 并继续安装？（安装完成后不会自动启动 QQ）",
+                            "需要关闭 QQ",
+                            MessageBoxButtons.YesNo,
+                            MessageBoxIcon.Question);
+                        if (answer != DialogResult.Yes)
+                        {
+                            _statusLabel.Text = "安装已取消。";
+                            ClearExitFlag(installDir);
+                            return;
+                        }
                     }
-                    Thread.Sleep(500);
+                    _statusLabel.Text = "正在关闭 QQ 以释放桥接文件...";
+                    Application.DoEvents();
+                    KillQQProcesses();
+                    Thread.Sleep(700);
                 }
 
-                string installDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "QQToastTray");
-                if (!Directory.Exists(installDir))
-                    Directory.CreateDirectory(installDir);
-
-                string trayExePath = Path.Combine(installDir, "QQToastTray.exe");
-                string dllPath = Path.Combine(installDir, "version.dll");
-                string bridgeJsPath = Path.Combine(installDir, "qq-bridge.js");
-                string configPath = Path.Combine(installDir, "config.json");
+                _statusLabel.Text = "正在部署托盘助手与内核桥接...";
+                Application.DoEvents();
 
                 ExtractResource("QQToastTray.exe", trayExePath);
                 ExtractResource("version.dll", dllPath);
                 ExtractResource("qq-bridge.js", bridgeJsPath);
 
+                // 无 BOM 的 UTF-8：qq-bridge.js 使用 JSON.parse 读取 config.json。
                 string configJson = string.Format(
                     "{{\"Enabled\":true,\"EnableGroupNotify\":true,\"MuteWhenQQForeground\":true,\"SuppressNativeQQBanner\":{0},\"FollowQQStartup\":true,\"MaxHistoryLines\":3,\"MaxCharsPerLine\":50,\"LocalPort\":39876}}",
                     _chkSuppressNative.Checked ? "true" : "false");
-                File.WriteAllText(configPath, configJson, Encoding.UTF8);
+                File.WriteAllText(configPath, configJson, new UTF8Encoding(false));
 
                 SetNativeQQNotificationSuppression(_chkSuppressNative.Checked);
 
@@ -250,18 +350,26 @@ namespace QQToastSetup
                 string escapedBridgePath = bridgeJsPath.Replace("\\", "\\\\");
                 string loaderScript = "// QQToastTray Loader\ntry { require(\"" + escapedBridgePath + "\"); } catch (e) {}\n";
 
+                int bridgeFailures = 0;
                 foreach (var vDir in Directory.GetDirectories(versionsDir))
                 {
-                    string resDir = Path.Combine(vDir, "resources");
-                    if (Directory.Exists(resDir))
+                    try
                     {
-                        File.WriteAllText(Path.Combine(resDir, "qqtoast.js"), loaderScript, Encoding.UTF8);
+                        string resDir = Path.Combine(vDir, "resources");
+                        if (!Directory.Exists(resDir)) continue;
+                        File.WriteAllText(Path.Combine(resDir, "qqtoast.js"), loaderScript, new UTF8Encoding(false));
                         File.Copy(dllPath, Path.Combine(vDir, "version.dll"), true);
+                    }
+                    catch
+                    {
+                        bridgeFailures++;
                     }
                 }
 
-                _statusLabel.Text = "正在启动托盘助手与 QQ...";
+                _statusLabel.Text = "正在启动托盘助手...";
                 Application.DoEvents();
+
+                ClearExitFlag(installDir);
 
                 Process.Start(new ProcessStartInfo
                 {
@@ -282,9 +390,21 @@ namespace QQToastSetup
                 }
 
                 _statusLabel.Text = "✅ 安装完成！托盘图标已在右下角运行。";
+                string extra = _chkRestartQQ.Checked
+                    ? "• 已重启 QQ，桥接立即生效\n"
+                    : "• 请手动启动 QQ 以加载桥接组件\n";
+                if (bridgeFailures > 0)
+                {
+                    extra += "• 注意: 有 " + bridgeFailures + " 个 QQ 版本目录写入失败（可能被占用）\n";
+                }
                 MessageBox.Show(
-                    "安装成功！\n\n• 托盘助手已在系统右下角托盘区运行\n• 已自动开启 QQ 免打扰同步过滤与原位多消息实时追加\n• 已自动屏蔽 QQ 原生重复弹窗",
-                    "安装完成",
+                    "安装成功！\n\n" +
+                    "• 托盘助手已在系统右下角托盘区运行\n" +
+                    extra +
+                    "• 已自动开启 QQ 免打扰同步过滤与原位多消息实时追加\n" +
+                    "• 已自动屏蔽 QQ 原生重复弹窗\n\n" +
+                    "提示: 点击通知横幅会打开 QQ 主窗口；能匹配到 QQ 原生通知时会继续定位到对应聊天。",
+                    "安装完成 (v1.1.1)",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Information);
             }
@@ -302,6 +422,7 @@ namespace QQToastSetup
 
         private void DoUninstall()
         {
+            string installDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "QQToastTray");
             try
             {
                 _btnInstall.Enabled = false;
@@ -309,15 +430,18 @@ namespace QQToastSetup
                 _statusLabel.Text = "正在卸载组件并恢复原版设置...";
                 Application.DoEvents();
 
-                foreach (var p in Process.GetProcessesByName("QQToastTray"))
+                // 写退出标记，防止桥接进程在卸载过程中自动拉起托盘。
+                WriteExitFlag(installDir);
+                StopTrayProcesses(installDir);
+
+                // 需要关闭 QQ 才能删除 qqtoast.js / version.dll。
+                if (Process.GetProcessesByName("QQ").Length > 0)
                 {
-                    try { p.Kill(); p.WaitForExit(2000); } catch { }
+                    _statusLabel.Text = "正在关闭 QQ 以移除桥接文件...";
+                    Application.DoEvents();
+                    KillQQProcesses();
+                    Thread.Sleep(700);
                 }
-                foreach (var p in Process.GetProcessesByName("QQ"))
-                {
-                    try { p.Kill(); p.WaitForExit(3000); } catch { }
-                }
-                Thread.Sleep(500);
 
                 string qqRoot = _qqPathBox.Text.Trim();
                 string versionsDir = Path.Combine(qqRoot, "versions");
@@ -343,19 +467,43 @@ namespace QQToastSetup
                     if (key != null) key.DeleteValue("QQToastTray", false);
                 }
 
-                string startMenuShortcut = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                    @"Microsoft\Windows\Start Menu\Programs\QQ 快捷回复助手.lnk");
-                if (File.Exists(startMenuShortcut)) File.Delete(startMenuShortcut);
+                // 清理 Toast 通知注册（CLSID / AUMID），否则点击通知中心里的旧通知
+                // 仍可能通过 LocalServer32 把托盘程序重新拉起来。
+                try
+                {
+                    Registry.CurrentUser.DeleteSubKeyTree(
+                        @"Software\Classes\CLSID\{E8B84582-4D5A-49A6-9375-52F570296A42}", false);
+                }
+                catch { }
+                try
+                {
+                    Registry.CurrentUser.DeleteSubKeyTree(
+                        @"Software\Classes\AppUserModelId\Tencent.QQNT.QuickReply", false);
+                }
+                catch { }
 
-                string installDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "QQToastTray");
+                try
+                {
+                    string startMenuDir = Environment.GetFolderPath(Environment.SpecialFolder.Programs);
+                    string startMenuShortcut = Path.Combine(startMenuDir, "QQ 快捷回复助手.lnk");
+                    if (File.Exists(startMenuShortcut)) File.Delete(startMenuShortcut);
+                }
+                catch { }
+
+                try
+                {
+                    string toastCache = Path.Combine(Path.GetTempPath(), "QQToastAvatars");
+                    if (Directory.Exists(toastCache)) Directory.Delete(toastCache, true);
+                }
+                catch { }
+
                 if (Directory.Exists(installDir))
                 {
                     try { Directory.Delete(installDir, true); } catch { }
                 }
 
                 _statusLabel.Text = "✅ 已彻底卸载，QQ 已恢复原版状态。";
-                MessageBox.Show("已成功卸载 QQ 快捷回复助手并恢复 QQ 原生通知设置！", "卸载完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show("已成功卸载 QQ 快捷回复助手并恢复 QQ 原生通知设置！\n\n请手动启动 QQ。", "卸载完成 (v1.1.1)", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             catch (Exception ex)
             {

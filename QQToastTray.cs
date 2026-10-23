@@ -62,11 +62,13 @@ namespace QQToastTray
         public string action { get; set; } // "reply" or "openChat"
         public int chatType { get; set; }
         public string peerUid { get; set; }
+        public string peerName { get; set; }
         public string content { get; set; }
 
         public ReplyCommand()
         {
             action = "reply";
+            peerName = "";
         }
     }
 
@@ -147,10 +149,15 @@ namespace QQToastTray
         private string _configPath;
         private string _bridgeJsPath;
         private string _logPath;
+        private string _exitFlagPath;
         private TcpListener _tcpListener;
         private Thread _serverThread;
         private volatile bool _running = true;
         private SynchronizationContext _uiContext;
+
+        private EventWaitHandle _exitEvent;
+        private int _exitRequested = 0;
+        private const string EXIT_EVENT_NAME = @"Local\QQToastTray_ExitEvent";
 
         private readonly object _queueLock = new object();
         private List<ReplyCommand> _pendingReplies = new List<ReplyCommand>();
@@ -170,6 +177,7 @@ namespace QQToastTray
         private readonly List<ToastNotification> _activeToasts = new List<ToastNotification>();
 
         public const string APP_AUMID = "Tencent.QQNT.QuickReply";
+        public const string APP_VERSION = "1.1.1";
         public const string ACTIVATOR_CLSID = "{E8B84582-4D5A-49A6-9375-52F570296A42}";
         private const string LIVE_TAG = "QQLiveBanner";
         private const string LIVE_GROUP = "QQQuickReply";
@@ -183,10 +191,7 @@ namespace QQToastTray
         private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
 
         [DllImport("user32.dll")]
-        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-
-        [DllImport("user32.dll")]
-        private static extern bool SetForegroundWindow(IntPtr hWnd);
+        private static extern bool AllowSetForegroundWindow(int dwProcessId);
 
         [DllImport("ole32.dll")]
         private static extern int CoRegisterClassObject(
@@ -291,18 +296,47 @@ namespace QQToastTray
             _configPath = Path.Combine(baseDir, "config.json");
             _bridgeJsPath = Path.Combine(baseDir, "qq-bridge.js");
             _logPath = Path.Combine(baseDir, "tray-debug.log");
+            _exitFlagPath = Path.Combine(baseDir, "tray-exit.flag");
 
-            Log("=== QQToastTray v1.1.0 starting ===");
+            Log("=== QQToastTray v" + APP_VERSION + " starting ===");
             LoadConfig();
             RegisterComActivatorAndAumid();
             InitTray();
             _uiContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
             StartLocalServer();
+            RegisterExitSignalWatcher();
 
             _statusTimer = new System.Windows.Forms.Timer();
             _statusTimer.Interval = 2500;
             _statusTimer.Tick += (s, e) => UpdateBridgeStatus();
             _statusTimer.Start();
+        }
+
+        // 支持外部（安装器/QQToastTray.exe --exit）请求托盘程序优雅退出。
+        private void RegisterExitSignalWatcher()
+        {
+            try
+            {
+                bool createdNew;
+                _exitEvent = new EventWaitHandle(false, EventResetMode.AutoReset, EXIT_EVENT_NAME, out createdNew);
+                ThreadPool.RegisterWaitForSingleObject(_exitEvent, (state, timedOut) =>
+                {
+                    if (timedOut) return;
+                    Log("Received graceful exit signal.");
+                    if (_uiContext != null)
+                    {
+                        _uiContext.Post(_ => ExitApplication(), null);
+                    }
+                    else
+                    {
+                        ExitApplication();
+                    }
+                }, null, Timeout.Infinite, false);
+            }
+            catch (Exception ex)
+            {
+                Log("RegisterExitSignalWatcher notice: " + ex.Message);
+            }
         }
 
         public void Log(string msg)
@@ -350,7 +384,9 @@ namespace QQToastTray
             {
                 var serializer = new JavaScriptSerializer();
                 var json = serializer.Serialize(_config);
-                File.WriteAllText(_configPath, json, Encoding.UTF8);
+                // 必须使用无 BOM 的 UTF-8：qq-bridge.js 使用 JSON.parse 读取该文件，
+                // BOM 会导致解析失败，从而误判“跟随 QQ 启动”仍为开启状态。
+                File.WriteAllText(_configPath, json, new UTF8Encoding(false));
             }
             catch { }
         }
@@ -576,40 +612,6 @@ namespace QQToastTray
                 SaveConfig();
             };
 
-            var testItem = new ToolStripMenuItem("发送多条测试通知 (体验打字中实时追加)");
-            testItem.Click += (s, e) =>
-            {
-                ShowQuickReplyToast(new IncomingMessage
-                {
-                    msgId = "test_1_" + DateTime.Now.Ticks,
-                    chatType = 1,
-                    peerUid = "test_peer",
-                    peerName = "测试好友",
-                    senderUid = "test_sender",
-                    senderName = "测试好友",
-                    content = "第 1 条：你可以现在开始在下方输入框打字（先别按回车）..."
-                });
-
-                // Simulate a 2nd message arriving 2.5 seconds later while user is typing!
-                var t1 = new System.Windows.Forms.Timer { Interval = 2500 };
-                t1.Tick += (s2, e2) =>
-                {
-                    t1.Stop();
-                    t1.Dispose();
-                    ShowQuickReplyToast(new IncomingMessage
-                    {
-                        msgId = "test_2_" + DateTime.Now.Ticks,
-                        chatType = 1,
-                        peerUid = "test_peer",
-                        peerName = "测试好友",
-                        senderUid = "test_sender",
-                        senderName = "测试好友",
-                        content = "第 2 条：看！新消息直接在上面追加了，没有打断你的输入框吧！"
-                    });
-                };
-                t1.Start();
-            };
-
             var injectAndRestartQQItem = new ToolStripMenuItem("修复桥接并重启 QQ");
             injectAndRestartQQItem.Click += (s, e) => SetupBridgeAndRestartQQ(true);
 
@@ -635,7 +637,6 @@ namespace QQToastTray
             _menu.Items.Add(_stackingMenu);
             _menu.Items.Add(_followQQItem);
             _menu.Items.Add(new ToolStripSeparator());
-            _menu.Items.Add(testItem);
             _menu.Items.Add(injectAndRestartQQItem);
             _menu.Items.Add(removeBridgeItem);
             _menu.Items.Add(new ToolStripSeparator());
@@ -645,7 +646,7 @@ namespace QQToastTray
             _trayIcon = new NotifyIcon
             {
                 Icon = CreateModernTrayIcon(_config.Enabled),
-                Text = "QQ Win11 快捷回复助手 v1.1.0",
+                Text = "QQ Win11 快捷回复助手 v" + APP_VERSION,
                 ContextMenuStrip = _menu,
                 Visible = true
             };
@@ -685,33 +686,39 @@ namespace QQToastTray
             if (connected)
             {
                 _statusItem.Text = "🟢 状态: 已连接 NTQQ 内核 (免打扰过滤已生效)";
-                _trayIcon.Text = "QQ Win11 快捷回复助手 v1.1.0 (已连接)";
+                _trayIcon.Text = "QQ Win11 快捷回复助手 v" + APP_VERSION + " (已连接)";
             }
             else
             {
                 _statusItem.Text = "🟡 状态: 等待 QQ 桥接连接";
-                _trayIcon.Text = "QQ Win11 快捷回复助手 v1.1.0 (等待QQ连接)";
+                _trayIcon.Text = "QQ Win11 快捷回复助手 v" + APP_VERSION + " (等待QQ连接)";
             }
         }
 
         private string GetQQInstallRoot()
         {
             string qqRoot = @"C:\Program Files\Tencent\QQNT";
-            try
+            string[] subKeys = new string[]
             {
-                using (var key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\WOW6432Node\Tencent\QQNT"))
+                @"SOFTWARE\WOW6432Node\Tencent\QQNT",
+                @"SOFTWARE\Tencent\QQNT"
+            };
+            foreach (string subKey in subKeys)
+            {
+                try
                 {
-                    if (key != null)
+                    using (var key = Registry.LocalMachine.OpenSubKey(subKey))
                     {
+                        if (key == null) continue;
                         var install = key.GetValue("Install") as string;
                         if (!string.IsNullOrEmpty(install) && Directory.Exists(install))
                         {
-                            qqRoot = install;
+                            return install;
                         }
                     }
                 }
+                catch { }
             }
-            catch { }
             return qqRoot;
         }
 
@@ -744,7 +751,7 @@ namespace QQToastTray
                         if (Directory.Exists(resDir))
                         {
                             string targetJs = Path.Combine(resDir, "qqtoast.js");
-                            File.WriteAllText(targetJs, loaderCode, Encoding.UTF8);
+                            File.WriteAllText(targetJs, loaderCode, new UTF8Encoding(false));
 
                             string targetDll = Path.Combine(vDir, "version.dll");
                             if (!File.Exists(targetDll))
@@ -998,7 +1005,7 @@ namespace QQToastTray
         {
             if (!_config.Enabled) return;
             if (msg.chatType == 2 && !_config.EnableGroupNotify) return;
-            if (_config.MuteWhenQQForeground && msg.peerUid != "test_peer" && IsQQForeground()) return;
+            if (_config.MuteWhenQQForeground && IsQQForeground()) return;
 
             if (_uiContext != null && SynchronizationContext.Current != _uiContext)
             {
@@ -1395,30 +1402,34 @@ namespace QQToastTray
 
                 if (isToastClick)
                 {
-                    Log("Toast clicked without replyText / toastClick (" + source + ") for peerUid=" + peerUid + ", chatType=" + chatType + ". Activating QQ main window.");
+                    bool bridgeOnline = (DateTime.Now - _lastBridgeHeartbeat).TotalSeconds < 10;
+                    Log("Toast clicked without replyText / toastClick (" + source + ") for peerUid=" + peerUid + ", chatType=" + chatType + ". bridgeOnline=" + bridgeOnline);
 
-                    // 1. Win32: Find QQ main window handle, restore and bring to foreground
-                    try
+                    // 关键修复：绝不能用 Win32 ShowWindow 去显示 QQ 隐藏的 Electron 窗口。
+                    // NTQQ 关闭到托盘后主窗口处于 BrowserWindow.hide() 状态，绕过 Electron
+                    // 直接用 Win32 显示会得到一个全灰/空白窗口（且可能显示 800x600 的辅助窗口）。
+                    // 正确做法：由 qq-bridge.js 通过 Electron API 找到真正主窗口再 show()/focus()。
+                    if (bridgeOnline)
                     {
-                        foreach (var proc in Process.GetProcessesByName("QQ"))
-                        {
-                            IntPtr hWnd = proc.MainWindowHandle;
-                            if (hWnd != IntPtr.Zero)
-                            {
-                                ShowWindow(hWnd, 9 /* SW_RESTORE */);
-                                SetForegroundWindow(hWnd);
-                                break;
-                            }
-                        }
+                        try { AllowSetForegroundWindow(-1 /* ASFW_ANY */); } catch { }
                     }
-                    catch (Exception exHwnd)
+                    else
                     {
-                        Log("SetForegroundWindow notice: " + exHwnd.Message);
+                        // 桥接尚未连接（例如刚装完还没重启 QQ）：让 QQ 自己的单实例激活逻辑
+                        // 还原主窗口，同样可以避免空白界面。
+                        TryActivateQQWithoutBridge();
                     }
 
-                    // 2. Dispatch openChat command to bridge for NTQQ in-app chat jump
+                    // Dispatch openChat command to bridge for NTQQ in-app chat jump
                     if (!string.IsNullOrEmpty(peerUid))
                     {
+                        string clickPeerName = "";
+                        ConversationState clickConv;
+                        if (_conversations.TryGetValue(sessionKey, out clickConv))
+                        {
+                            clickPeerName = clickConv.PeerName ?? "";
+                        }
+
                         lock (_queueLock)
                         {
                             _pendingReplies.Add(new ReplyCommand
@@ -1427,12 +1438,13 @@ namespace QQToastTray
                                 action = "openChat",
                                 chatType = chatType,
                                 peerUid = peerUid,
+                                peerName = clickPeerName,
                                 content = ""
                             });
                         }
                     }
 
-                    // 3. Clear active banner
+                    // Clear active banner
                     if (_uiContext != null)
                     {
                         _uiContext.Post(_ =>
@@ -1472,12 +1484,6 @@ namespace QQToastTray
                     }, null);
                 }
 
-                if (peerUid == "test_peer")
-                {
-                    ShowSimpleConfirmToast("测试回复已捕获！", "你刚才输入的回复内容是：「" + replyText + "」（全程未弹出主窗口）");
-                    return;
-                }
-
                 if (!string.IsNullOrEmpty(peerUid))
                 {
                     lock (_queueLock)
@@ -1499,26 +1505,39 @@ namespace QQToastTray
             }
         }
 
-        private void ShowSimpleConfirmToast(string title, string content)
+        // 桥接未连接时的兜底激活：仅在 QQ 根本没运行时才启动 QQ。
+        // 如果 QQ 已在运行但桥接未加载，再启动一个 QQ.exe 会弹出登录窗口，
+        // 因此这里宁可什么都不做。
+        private void TryActivateQQWithoutBridge()
         {
             try
             {
-                string xmlString =
-                    "<toast>" +
-                        "<visual>" +
-                            "<binding template=\"ToastGeneric\">" +
-                                "<text>" + EscapeXml(title) + "</text>" +
-                                "<text>" + EscapeXml(content) + "</text>" +
-                            "</binding>" +
-                        "</visual>" +
-                    "</toast>";
-                XmlDocument doc = new XmlDocument();
-                doc.LoadXml(xmlString);
-                ToastNotification toast = new ToastNotification(doc);
-                toast.ExpirationTime = DateTimeOffset.Now.AddSeconds(5);
-                ToastNotificationManager.CreateToastNotifier(_activeAumid).Show(toast);
+                if (Process.GetProcessesByName("QQ").Length > 0)
+                {
+                    Log("Bridge offline but QQ is already running; skip second-instance launch (would open a login window).");
+                    return;
+                }
+
+                string qqExe = Path.Combine(GetQQInstallRoot(), "QQ.exe");
+                if (File.Exists(qqExe))
+                {
+                    Process.Start(new ProcessStartInfo
+                    {
+                        FileName = qqExe,
+                        WorkingDirectory = Path.GetDirectoryName(qqExe),
+                        UseShellExecute = true
+                    });
+                    Log("QQ is not running; launched QQ.exe.");
+                }
+                else
+                {
+                    Log("QQ is not running and QQ.exe not found; cannot open QQ.");
+                }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Log("TryActivateQQWithoutBridge error: " + ex.Message);
+            }
         }
 
         private void StartLocalServer()
@@ -1662,27 +1681,111 @@ namespace QQToastTray
             _serverThread.Start();
         }
 
+        private void WriteExitFlag()
+        {
+            try
+            {
+                long ms = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds;
+                File.WriteAllText(_exitFlagPath, ms.ToString(), new UTF8Encoding(false));
+            }
+            catch { }
+        }
+
         private void ExitApplication()
         {
+            if (Interlocked.Exchange(ref _exitRequested, 1) != 0)
+            {
+                return;
+            }
+
             _running = false;
+
+            // 1) 留下“用户主动退出”标记：qq-bridge.js 据此停止自动拉起托盘，
+            //    避免退出后 1 秒内又被桥接进程重新启动（旧版的“无法完全退出”问题）。
+            WriteExitFlag();
+            Log("Exit requested by user. Wrote tray-exit.flag and shutting down.");
+
+            // 2) 停止定时器、清理通知、注销 COM、关闭监听端口。
+            try { if (_statusTimer != null) { _statusTimer.Stop(); _statusTimer.Dispose(); } } catch { }
+            try { ToastNotificationManager.History.Remove(LIVE_TAG, LIVE_GROUP, _activeAumid); } catch { }
+            try { ToastNotificationManager.History.Clear(_activeAumid); } catch { }
             try { if (_comCookie != 0) CoRevokeClassObject(_comCookie); } catch { }
             try { if (_tcpListener != null) _tcpListener.Stop(); } catch { }
+
+            // 3) 恢复 QQ 原生系统通知（否则退出后用户会完全收不到 QQ 通知）。
+            try { ApplyNativeQQNotificationSuppression(false); } catch { }
+
+            // 4) 隐藏托盘图标并强制结束进程，确保任务管理器中不会残留。
             if (_trayIcon != null)
             {
                 _trayIcon.Visible = false;
                 _trayIcon.Dispose();
+                _trayIcon = null;
             }
+
+            Instance = null;
             Application.Exit();
+            Environment.Exit(0);
         }
     }
 
     static class Program
     {
         private static Mutex _mutex;
+        private const string EXIT_EVENT_NAME = @"Local\QQToastTray_ExitEvent";
+
+        private static bool HasArg(string[] args, string keyword)
+        {
+            foreach (string arg in args)
+            {
+                if (!string.IsNullOrEmpty(arg) && arg.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static bool TrySignalRunningInstance()
+        {
+            try
+            {
+                using (EventWaitHandle ev = EventWaitHandle.OpenExisting(EXIT_EVENT_NAME))
+                {
+                    ev.Set();
+                    return true;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
 
         [STAThread]
         static void Main()
         {
+            string[] args = Environment.GetCommandLineArgs();
+            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+            string exitFlagPath = Path.Combine(baseDir, "tray-exit.flag");
+
+            // 外部请求优雅退出：QQToastTray.exe --exit
+            if (HasArg(args, "--exit"))
+            {
+                if (!TrySignalRunningInstance())
+                {
+                    try { if (File.Exists(exitFlagPath)) File.Delete(exitFlagPath); } catch { }
+                }
+                return;
+            }
+
+            // 用户主动退出后，Windows 仍可能因点击通知中心里的旧通知而通过 COM 拉起本程序。
+            // 这里直接忽略，避免“退出后又复活”。
+            if (HasArg(args, "-ToastActivated") && File.Exists(exitFlagPath))
+            {
+                return;
+            }
+
             bool createdNew;
             _mutex = new Mutex(true, "Local\\QQToastTray_Singleton_Mutex", out createdNew);
             if (!createdNew)
@@ -1690,11 +1793,14 @@ namespace QQToastTray
                 return;
             }
 
+            // 正常（手动/开机/跟随 QQ）启动时清除退出标记。
+            try { if (File.Exists(exitFlagPath)) File.Delete(exitFlagPath); } catch { }
+
             AppDomain.CurrentDomain.UnhandledException += (s, e) =>
             {
                 try
                 {
-                    string p = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tray-debug.log");
+                    string p = Path.Combine(baseDir, "tray-debug.log");
                     File.AppendAllText(p, "[FATAL UnhandledException] " + e.ExceptionObject + Environment.NewLine);
                 }
                 catch { }
@@ -1703,7 +1809,7 @@ namespace QQToastTray
             {
                 try
                 {
-                    string p = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tray-debug.log");
+                    string p = Path.Combine(baseDir, "tray-debug.log");
                     File.AppendAllText(p, "[FATAL ThreadException] " + e.Exception + Environment.NewLine);
                 }
                 catch { }

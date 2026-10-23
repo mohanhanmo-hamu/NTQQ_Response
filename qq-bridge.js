@@ -1,7 +1,9 @@
 /**
- * NTQQ <-> QQToastTray Bridge (qq-bridge.js v6)
+ * NTQQ <-> QQToastTray Bridge (qq-bridge.js v7)
  * - Respects QQ DND (Do-Not-Disturb) settings via onRecvActiveMsg + @me detection
  * - Resolves friend remark/nickname & avatars via BuddyService / ProfileService / RecentContactService
+ * - Opens the REAL QQ main window through Electron APIs (never via Win32 ShowWindow)
+ * - Honors a user-initiated tray exit (tray-exit.flag) instead of relaunching it forever
  */
 
 (function () {
@@ -18,6 +20,9 @@
 
     const TRAY_PORT = 39876;
     const LOG_FILE = path.join(__dirname, 'bridge-debug.log');
+    const CONFIG_FILE = path.join(__dirname, 'config.json');
+    const EXIT_FLAG_FILE = path.join(__dirname, 'tray-exit.flag');
+    const BRIDGE_START_MS = Date.now();
 
     function log(...args) {
       try {
@@ -31,7 +36,7 @@
       } catch (e) {}
     }
 
-    log('=== qq-bridge.js v6 initialized ===');
+    log('=== qq-bridge.js v7 initialized ===');
 
     let wrapperApi = null;
     let sessionInstance = null;
@@ -49,6 +54,7 @@
     const contactNameCache = new Map(); // uid/peerUid -> name
     const avatarPathCache = new Map();  // uid/peerUid -> local file path
     const dndPeerMap = new Map();       // peerUid -> boolean (true if DND/muted)
+    let lastMsgMeta = { peerUid: '', peerName: '', at: 0 };
 
     let loggedSamplePicElement = false;
 
@@ -291,7 +297,12 @@
             seenMsgIds.delete(first);
           }
 
+          lastMsgMeta = { peerUid: peerUid, peerName: String(msg.peerName || ''), at: Date.now() };
+          associateNativeNotifications(peerUid, lastMsgMeta.peerName, lastMsgMeta.at);
+
           const { senderName, peerName } = await resolveContactName(chatType, peerUid, String(msg.senderUid || ''), msg);
+          lastMsgMeta = { peerUid: peerUid, peerName: peerName || lastMsgMeta.peerName, at: Date.now() };
+          associateNativeNotifications(peerUid, lastMsgMeta.peerName, lastMsgMeta.at);
 
           let avatarPath = avatarPathCache.get(peerUid) || '';
           try {
@@ -667,6 +678,146 @@
 
     let lastTrayAliveMs = 0;
 
+    // QQ 自己弹出的 Electron 通知被我们拦截不显示，但它的 click 监听器
+    // 正是 QQ 原生“点击通知跳转会话”的实现。这里保存对象引用，等用户点击
+    // 我们的快捷回复通知时，直接触发它，复用 QQ 自己的跳转逻辑。
+    const nativeNotifications = [];
+    let nativeDetailLogs = 0;
+
+    function associateNativeNotifications(peerUid, peerName, atMs) {
+      if (!peerUid || !atMs) return;
+      for (let i = nativeNotifications.length - 1; i >= 0; i--) {
+        const rec = nativeNotifications[i];
+        if (atMs - rec.ts > 8000) break;
+        const delta = Math.abs(rec.ts - atMs);
+        if (delta > 5000) continue;
+        const prevDelta = rec.assocAt ? Math.abs(rec.ts - rec.assocAt) : Infinity;
+        // 以“离通知时间最近的那条消息”为准，被更近的消息覆盖。
+        if (!rec.peerUid || delta < prevDelta) {
+          rec.peerUid = peerUid;
+          rec.peerName = peerName || rec.peerName;
+          rec.assocAt = atMs;
+        }
+      }
+    }
+
+    function captureNativeNotification(n) {
+      try {
+        const now = Date.now();
+        const recentMsg = (now - lastMsgMeta.at < 3000) ? lastMsgMeta : null;
+        const record = {
+          ts: now,
+          peerUid: recentMsg ? recentMsg.peerUid : '',
+          peerName: recentMsg ? recentMsg.peerName : '',
+          assocAt: recentMsg ? recentMsg.at : 0,
+          title: String(n.title || ''),
+          body: String(n.body || ''),
+          tag: String(n.tag || ''),
+          hasReply: !!n.hasReply,
+          clickListeners: (typeof n.listenerCount === 'function') ? n.listenerCount('click') : -1,
+          ref: n
+        };
+        nativeNotifications.push(record);
+        while (nativeNotifications.length > 30) {
+          nativeNotifications.shift();
+        }
+        log('Captured native notification: ' + JSON.stringify({
+          title: record.title, body: record.body, tag: record.tag,
+          hasReply: record.hasReply, clickListeners: record.clickListeners,
+          peerUid: record.peerUid, peerName: record.peerName
+        }));
+
+        // 诊断信息：QQ 的通知 title/body 为空，但对象上可能有 toastXml
+        // 或自定义属性；click 监听器的源码能直接看出 QQ 原生跳转用了什么参数。
+        if (nativeDetailLogs < 10) {
+          nativeDetailLogs++;
+          let own = [];
+          let proto = [];
+          let toastXml = '';
+          let listenerSource = '';
+          try { own = Object.getOwnPropertyNames(n); } catch (e) {}
+          try { proto = Object.getOwnPropertyNames(Object.getPrototypeOf(n) || {}); } catch (e) {}
+          try {
+            if (typeof n.toastXml === 'function') toastXml = String(n.toastXml());
+            else if (typeof n.toastXml === 'string') toastXml = n.toastXml;
+          } catch (e) {}
+          try {
+            const listeners = n.listeners('click');
+            if (listeners && listeners.length > 0) {
+              listenerSource = String(listeners[0]).slice(0, 1500);
+            }
+          } catch (e) {}
+          log('Native notification details: ' + JSON.stringify({
+            own: own, proto: proto, peerUid: record.peerUid, peerName: record.peerName,
+            toastXml: String(toastXml || '').slice(0, 1500), listenerSource: listenerSource
+          }));
+        }
+      } catch (e) {}
+    }
+
+    function emitNativeNotificationClick(item) {
+      if (nativeNotifications.length === 0) {
+        log('No captured native notification to click.');
+        return false;
+      }
+
+      const peerUid = String((item && item.peerUid) || '');
+      const name = String((item && item.peerName) || '').trim();
+      const now = Date.now();
+      let pick = null;
+
+      // 1) 优先按“消息 -> 通知”的时间关联匹配 peerUid（QQ 通知的 title/body 是空的）
+      if (peerUid) {
+        for (let i = nativeNotifications.length - 1; i >= 0; i--) {
+          const rec = nativeNotifications[i];
+          if (now - rec.ts > 5 * 60 * 1000) continue;
+          if (rec.peerUid === peerUid) {
+            pick = rec;
+            break;
+          }
+        }
+      }
+
+      // 2) 退化匹配：标题/正文/记录中的会话名
+      if (!pick && name) {
+        for (let i = nativeNotifications.length - 1; i >= 0; i--) {
+          const rec = nativeNotifications[i];
+          if (now - rec.ts > 5 * 60 * 1000) continue;
+          if (rec.peerName === name ||
+              (rec.title && rec.title.indexOf(name) >= 0) ||
+              (rec.body && rec.body.indexOf(name) >= 0)) {
+            pick = rec;
+            break;
+          }
+        }
+      }
+
+      if (!pick) {
+        log('No matching native notification for peerUid=' + peerUid + ', peerName=' + name + '; skip native click.');
+        return false;
+      }
+
+      try {
+        const count = (typeof pick.ref.listenerCount === 'function') ? pick.ref.listenerCount('click') : 0;
+        let source = '';
+        try {
+          const listeners = pick.ref.listeners('click');
+          if (listeners && listeners.length > 0) source = String(listeners[0]).slice(0, 500);
+        } catch (e) {}
+        log('Emitting native notification click: matchedPeerUid=' + pick.peerUid +
+            ', matchedPeerName=' + pick.peerName + ', ageMs=' + (now - pick.ts) +
+            ', listeners=' + count + ', source=' + source);
+        if (count <= 0) {
+          return false;
+        }
+        pick.ref.emit('click', {});
+        return true;
+      } catch (e) {
+        log('emitNativeNotificationClick error: ' + e.message);
+        return false;
+      }
+    }
+
     function inspectAndCacheIpcPayload(item) {
       if (!item || typeof item !== 'object') return;
       const cmd = String(item.cmdName || item.callbackId || '');
@@ -730,6 +881,9 @@
         if (electron.Notification && electron.Notification.prototype) {
           const origShow = electron.Notification.prototype.show;
           electron.Notification.prototype.show = function (...args) {
+            // Capture the object before deciding to suppress it: its click
+            // listener is QQ's own "open the right conversation" handler.
+            captureNativeNotification(this);
             if (Date.now() - lastTrayAliveMs < 5000) {
               log('Suppressed duplicate native Electron Notification');
               return;
@@ -778,50 +932,221 @@
       return exported;
     };
 
+    // ---------------------------------------------------------------------
+    // Open-chat support
+    //
+    // NTQQ keeps several hidden Electron BrowserWindows alive (the 800x600
+    // login/helper window, the 720x640 auxiliary window, the tiny tray host...).
+    // The old code simply showed the first window larger than 400x400, which
+    // popped up a blank grey helper window instead of the QQ main window.
+    // We now pick the real main window by URL (#/main/message), never by size
+    // alone. We also never call the native jump API directly any more: on this
+    // QQ version it cleared the active conversation and produced a blank chat
+    // pane. Instead we replay QQ's own notification click handler when possible.
+    // ---------------------------------------------------------------------
+    function describeWindow(win) {
+      try {
+        const bounds = win.getBounds ? win.getBounds() : { width: 0, height: 0 };
+        let url = '';
+        try { url = win.webContents && win.webContents.getURL ? String(win.webContents.getURL() || '') : ''; } catch (e) {}
+        return {
+          id: win.id,
+          title: (win.getTitle ? win.getTitle() : '') || '',
+          width: bounds.width || 0,
+          height: bounds.height || 0,
+          visible: win.isVisible ? win.isVisible() : false,
+          minimized: win.isMinimized ? win.isMinimized() : false,
+          resizable: win.isResizable ? win.isResizable() : false,
+          minimizable: win.isMinimizable ? win.isMinimizable() : false,
+          url: url
+        };
+      } catch (e) {
+        return { id: -1, title: '', width: 0, height: 0, visible: false, minimized: false, resizable: false, minimizable: false, url: '' };
+      }
+    }
+
+    function pickQQMainWindow(electron) {
+      const all = electron.BrowserWindow.getAllWindows().filter(w => w && !(w.isDestroyed && w.isDestroyed()));
+      const infos = all.map(win => ({ win: win, info: describeWindow(win) })).filter(x => {
+        const i = x.info;
+        if (i.width < 600 || i.height < 400) return false;
+        if (/devtools/i.test(i.url)) return false;
+        return true;
+      });
+
+      log('openChat candidate windows:', infos.map(x => x.info));
+
+      // 通过 URL 精确识别主窗口，避免把 #/blank 的空白辅助窗口或
+      // #/chat 的独立聊天池窗口当主窗口显示出来。
+      const isBlankHelper = (url) => /#\/blank/i.test(url) || /chatPoolWin=1/i.test(url);
+      const isMainPage = (url) => /#\/main(\/|$)/i.test(url) || /\/main\/message/i.test(url);
+
+      let pool = infos.filter(x => isMainPage(x.info.url) && !isBlankHelper(x.info.url));
+      if (pool.length === 0) {
+        pool = infos.filter(x => !isBlankHelper(x.info.url));
+      }
+      if (pool.length === 0) {
+        return null; // 宁可触发 QQ 自身的激活逻辑，也不要显示空白辅助窗口
+      }
+
+      // Prefer windows that are actually resizable (QQ main window). Hidden
+      // helper/login windows are usually fixed-size and much smaller.
+      pool.sort((a, b) => {
+        if (a.info.resizable !== b.info.resizable) return a.info.resizable ? -1 : 1;
+        if (a.info.minimizable !== b.info.minimizable) return a.info.minimizable ? -1 : 1;
+        return (b.info.width * b.info.height) - (a.info.width * a.info.height);
+      });
+
+      return pool[0].win;
+    }
+
+    // QQ 有时在自动登录后并不会创建主窗口（只驻留托盘）。此时由 QQ 原生
+    // 通知的 click 回调负责创建/显示主窗口；这里不再主动启动第二个 QQ 进程，
+    // 避免出现新的登录窗口。
+
+    function showMainWindow(win) {
+      try {
+        if (win.isMinimized && win.isMinimized()) win.restore();
+        // Always go through Electron's show(): calling Win32 ShowWindow on a
+        // BrowserWindow hidden with hide() produces a blank white/grey window.
+        if (win.show) win.show();
+        if (win.focus) win.focus();
+        if (win.moveTop) win.moveTop();
+        if (win.webContents && win.webContents.focus) win.webContents.focus();
+        return true;
+      } catch (e) {
+        log('showMainWindow error:', e.message);
+        return false;
+      }
+    }
+
+    // 从隐藏/最小化状态恢复后主动刷新一次窗口内容，避免 Chromium 合成层
+    // 偶发不重绘（历史版本出现过空白聊天区）。
+    function repaintQQWindows(electron, win) {
+      try {
+        let count = 0;
+        try {
+          const all = electron.webContents.getAllWebContents();
+          for (const wc of all) {
+            try {
+              if (wc && !wc.isDestroyed() && typeof wc.invalidate === 'function') {
+                wc.invalidate();
+                count++;
+              }
+            } catch (e) {}
+          }
+        } catch (e) {}
+        try {
+          if (win.webContents && typeof win.webContents.invalidate === 'function') {
+            win.webContents.invalidate();
+            count++;
+          }
+        } catch (e) {}
+        log('Repaint: invalidated ' + count + ' webContents.');
+      } catch (e) {
+        log('repaintQQWindows error: ' + e.message);
+      }
+    }
+
     function handleOpenChat(item) {
-      log('Handling openChat for peerUid=' + item.peerUid + ', chatType=' + item.chatType);
+      log('Handling openChat for peerUid=' + item.peerUid + ', chatType=' + item.chatType + ', peerName=' + item.peerName);
+      const nativeClicked = emitNativeNotificationClick(item);
+      log('Native notification click emitted=' + nativeClicked);
       try {
         let electron = null;
         try { electron = require('electron'); } catch (e) {}
-        if (electron && electron.BrowserWindow && typeof electron.BrowserWindow.getAllWindows === 'function') {
-          const windows = electron.BrowserWindow.getAllWindows();
-          for (const win of windows) {
-            if (!win || win.isDestroyed()) continue;
-            const bounds = win.getBounds ? win.getBounds() : { width: 0, height: 0 };
-            const title = (win.getTitle ? win.getTitle() : '') || '';
-            if (title === 'QQ' || (bounds.width > 400 && bounds.height > 400)) {
-              if (win.isMinimized && win.isMinimized()) win.restore();
-              if (win.show) win.show();
-              if (win.setAlwaysOnTop) {
-                win.setAlwaysOnTop(true);
-                setTimeout(() => { try { if (!win.isDestroyed()) win.setAlwaysOnTop(false); } catch (e) {} }, 300);
-              }
-              if (win.focus) win.focus();
-              break;
-            }
-          }
-        }
-      } catch (eWin) {
-        log('handleOpenChat wake window error:', eWin.message);
-      }
 
-      try {
-        if (recentContactServiceInstance) {
-          const jumpParam = {
-            chatType: Number(item.chatType || 1),
-            peerUid: String(item.peerUid || ''),
-            guildId: ''
-          };
-          if (typeof recentContactServiceInstance.jumpToSpecifyRecentContact === 'function') {
-            recentContactServiceInstance.jumpToSpecifyRecentContact(jumpParam);
-            log('Called jumpToSpecifyRecentContact successfully');
-          } else if (typeof recentContactServiceInstance.jumpToSpecifyRecentContactVer2 === 'function') {
-            recentContactServiceInstance.jumpToSpecifyRecentContactVer2(jumpParam);
-            log('Called jumpToSpecifyRecentContactVer2 successfully');
-          }
+        if (!electron || !electron.BrowserWindow || typeof electron.BrowserWindow.getAllWindows !== 'function') {
+          log('Electron BrowserWindow API unavailable.');
+          return;
         }
-      } catch (eJump) {
-        log('handleOpenChat jump error:', eJump.message);
+
+        const ensureQQWindow = (delayMs) => {
+          setTimeout(() => {
+            try {
+              const w = pickQQMainWindow(electron);
+              if (!w) {
+                log('QQ main window is not available.');
+                return;
+              }
+              const info = describeWindow(w);
+              showMainWindow(w);
+              repaintQQWindows(electron, w);
+              setTimeout(() => { try { repaintQQWindows(electron, w); } catch (e) {} }, 450);
+              log('Ensured QQ main window: ' + JSON.stringify(info));
+            } catch (e) {
+              log('ensureQQWindow error: ' + e.message);
+            }
+          }, delayMs);
+        };
+
+        if (nativeClicked) {
+          // 先让 QQ 自己的通知点击逻辑完成打开/跳转，稍后再兜底确保窗口可见。
+          log('QQ native notification click emitted; QQ handles window and conversation switch.');
+          ensureQQWindow(600);
+          return;
+        }
+
+        const win = pickQQMainWindow(electron);
+        if (win) {
+          const info = describeWindow(win);
+          showMainWindow(win);
+          log('Showed QQ main window: ' + JSON.stringify(info) + ', wasHidden=' + !info.visible);
+          repaintQQWindows(electron, win);
+          setTimeout(() => { try { repaintQQWindows(electron, win); } catch (e) {} }, 450);
+          log('Opened QQ main window without forcing a conversation switch.');
+          return;
+        }
+
+        log('No main window and no native notification click available; nothing to open.');
+      } catch (eWin) {
+        log('handleOpenChat error: ' + eWin.message);
+      }
+    }
+
+    // ---------------------------------------------------------------------
+    // Tray auto-launch (follow QQ startup)
+    // ---------------------------------------------------------------------
+    function readConfigSafely() {
+      try {
+        if (!fs.existsSync(CONFIG_FILE)) return null;
+        // .NET's Encoding.UTF8 used to write a BOM here; JSON.parse() chokes
+        // on it and the old code silently fell back to "follow=true".
+        let raw = fs.readFileSync(CONFIG_FILE, 'utf8');
+        if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
+        raw = raw.replace(/^\uFEFF/, '').trim();
+        if (!raw) return null;
+        return JSON.parse(raw);
+      } catch (e) {
+        return null;
+      }
+    }
+
+    function getConfigBool(name, defaultValue) {
+      // Retry once: the tray may be rewriting config.json at this exact moment.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const cfg = readConfigSafely();
+        if (cfg && typeof cfg === 'object') {
+          const key = Object.keys(cfg).find(k => String(k).toLowerCase() === name.toLowerCase());
+          if (key !== undefined) return cfg[key] !== false;
+          return defaultValue;
+        }
+      }
+      return defaultValue;
+    }
+
+    function userQuitTraySinceBridgeStart() {
+      try {
+        if (!fs.existsSync(EXIT_FLAG_FILE)) return false;
+        const raw = fs.readFileSync(EXIT_FLAG_FILE, 'utf8').trim();
+        const flagMs = parseInt(raw, 10);
+        if (!isNaN(flagMs)) {
+          return flagMs > BRIDGE_START_MS;
+        }
+        // Fallback for legacy/empty flag files: compare mtime.
+        return fs.statSync(EXIT_FLAG_FILE).mtimeMs > BRIDGE_START_MS;
+      } catch (e) {
+        return false;
       }
     }
 
@@ -830,23 +1155,23 @@
 
     function tryAutoLaunchTray() {
       try {
+        // Respect the tray's "跟随 QQ 启动自动运行" switch. It must be re-read
+        // on every attempt so toggling it off takes effect immediately.
+        if (!getConfigBool('FollowQQStartup', true)) {
+          return;
+        }
+
+        // The user explicitly chose "退出程序" during this QQ session:
+        // stay quit instead of resurrecting the tray on every poll failure.
+        if (userQuitTraySinceBridgeStart()) {
+          return;
+        }
+
         const now = Date.now();
         if (now - lastTrayLaunchAttemptMs < 15000) {
           return;
         }
         lastTrayLaunchAttemptMs = now;
-
-        let follow = true;
-        const configPath = path.join(__dirname, 'config.json');
-        if (fs.existsSync(configPath)) {
-          try {
-            const raw = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-            if (raw && raw.FollowQQStartup === false) {
-              follow = false;
-            }
-          } catch (e) {}
-        }
-        if (!follow) return;
 
         const trayExePath = path.join(__dirname, 'QQToastTray.exe');
         if (fs.existsSync(trayExePath)) {
