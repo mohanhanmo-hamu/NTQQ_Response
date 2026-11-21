@@ -1,9 +1,15 @@
 /**
- * NTQQ <-> QQToastTray Bridge (qq-bridge.js v7)
- * - Respects QQ DND (Do-Not-Disturb) settings via onRecvActiveMsg + @me detection
- * - Resolves friend remark/nickname & avatars via BuddyService / ProfileService / RecentContactService
- * - Opens the REAL QQ main window through Electron APIs (never via Win32 ShowWindow)
- * - Honors a user-initiated tray exit (tray-exit.flag) instead of relaunching it forever
+ * NTQQ <-> QQToastTray Bridge (qq-bridge.js v8)
+ *
+ * Improvements in v8 (v1.2.0):
+ *  - Reads LocalPort, AuthToken, FollowQQStartup, VerboseLog dynamically from config.json
+ *  - Sends X-Auth-Token header on /notify and /poll for local IPC security
+ *  - Reports running NTQQ version, loader patch status, and synced DND count to tray
+ *  - Privacy-safe logging by default (redacts message plaintext unless VerboseLog is enabled)
+ *  - Automatic log rotation at 512 KB to prevent unbounded disk growth
+ *  - Bounded in-memory caches (contacts, avatars, seen message IDs)
+ *  - Preserves all v7 reliability fixes: DND filtering, native click reuse, real main-window
+ *    detection, and graceful exit flag handling
  */
 
 (function () {
@@ -13,19 +19,109 @@
       return;
     }
 
+    // Guard against double-loading if both qqt.js and legacy qqtoast.js ever trigger
+    if (global.__NTQQ_RESPONSE_BRIDGE_LOADED__) {
+      return;
+    }
+    global.__NTQQ_RESPONSE_BRIDGE_LOADED__ = true;
+
     const http = require('http');
     const fs = require('fs');
     const path = require('path');
     const Module = require('module');
 
-    const TRAY_PORT = 39876;
+    const BRIDGE_VERSION = '8';
+    const DEFAULT_PORT = 39876;
     const LOG_FILE = path.join(__dirname, 'bridge-debug.log');
+    const LOG_BACKUP_FILE = path.join(__dirname, 'bridge-debug.log.1');
+    const LOG_MAX_BYTES = 512 * 1024;
     const CONFIG_FILE = path.join(__dirname, 'config.json');
     const EXIT_FLAG_FILE = path.join(__dirname, 'tray-exit.flag');
     const BRIDGE_START_MS = Date.now();
+    const LOADER_STATUS = String(process.env.QQTOAST_LOADER_STATUS || 'legacy');
+
+    function detectRunningQQVersion() {
+      try {
+        const resPath = process.resourcesPath || '';
+        if (resPath) {
+          const verDir = path.basename(path.dirname(resPath));
+          if (/^\d+\.\d+/.test(verDir)) return verDir;
+        }
+        const exeDir = path.basename(path.dirname(process.execPath || ''));
+        if (/^\d+\.\d+/.test(exeDir)) return exeDir;
+      } catch (e) {}
+      return 'unknown';
+    }
+    const RUNNING_QQ_VERSION = detectRunningQQVersion();
+
+    // ---------------------------------------------------------------------
+    // Config & rotating privacy-safe logger
+    // ---------------------------------------------------------------------
+    let cachedConfig = null;
+    let cachedConfigAt = 0;
+
+    function readConfigSafely(forceFresh) {
+      const now = Date.now();
+      if (!forceFresh && cachedConfig && (now - cachedConfigAt) < 2000) {
+        return cachedConfig;
+      }
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          if (!fs.existsSync(CONFIG_FILE)) return cachedConfig;
+          let raw = fs.readFileSync(CONFIG_FILE, 'utf8');
+          if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
+          raw = raw.replace(/^\uFEFF/, '').trim();
+          if (!raw) continue;
+          cachedConfig = JSON.parse(raw);
+          cachedConfigAt = now;
+          return cachedConfig;
+        } catch (e) {}
+      }
+      return cachedConfig;
+    }
+
+    function getConfigValue(name, defaultValue, forceFresh) {
+      const cfg = readConfigSafely(forceFresh);
+      if (cfg && typeof cfg === 'object') {
+        const key = Object.keys(cfg).find(k => String(k).toLowerCase() === name.toLowerCase());
+        if (key !== undefined && cfg[key] !== undefined && cfg[key] !== null) {
+          return cfg[key];
+        }
+      }
+      return defaultValue;
+    }
+
+    function getTrayPort() {
+      const p = Number(getConfigValue('LocalPort', DEFAULT_PORT, false));
+      return (p >= 1024 && p <= 65535) ? p : DEFAULT_PORT;
+    }
+
+    function getAuthToken() {
+      return String(getConfigValue('AuthToken', '', false) || '');
+    }
+
+    function isVerboseLog() {
+      return getConfigValue('VerboseLog', false, false) === true;
+    }
+
+    let logWriteCount = 0;
+    function rotateLogIfNeeded() {
+      try {
+        if (!fs.existsSync(LOG_FILE)) return;
+        const st = fs.statSync(LOG_FILE);
+        if (st.size >= LOG_MAX_BYTES) {
+          try { if (fs.existsSync(LOG_BACKUP_FILE)) fs.unlinkSync(LOG_BACKUP_FILE); } catch (e) {}
+          fs.renameSync(LOG_FILE, LOG_BACKUP_FILE);
+        }
+      } catch (e) {}
+    }
 
     function log(...args) {
       try {
+        logWriteCount++;
+        if (logWriteCount === 1 || logWriteCount % 50 === 0) {
+          rotateLogIfNeeded();
+        }
         const line = `[${new Date().toISOString()}] [PID:${process.pid}] ` + args.map(a => {
           if (typeof a === 'object') {
             try { return JSON.stringify(a); } catch { return String(a); }
@@ -36,7 +132,19 @@
       } catch (e) {}
     }
 
-    log('=== qq-bridge.js v7 initialized ===');
+    log(`=== qq-bridge.js v${BRIDGE_VERSION} initialized | QQ=${RUNNING_QQ_VERSION} | loader=${LOADER_STATUS} ===`);
+
+    // ---------------------------------------------------------------------
+    // Bounded Map helper & kernel state
+    // ---------------------------------------------------------------------
+    function setBounded(map, key, value, maxSize) {
+      if (map.has(key)) map.delete(key);
+      map.set(key, value);
+      if (map.size > maxSize) {
+        const firstKey = map.keys().next().value;
+        map.delete(firstKey);
+      }
+    }
 
     let wrapperApi = null;
     let sessionInstance = null;
@@ -50,14 +158,50 @@
     let keptListenerRef = null;
     let selfUid = '';
     let selfUin = '';
+
     const seenMsgIds = new Set();
-    const contactNameCache = new Map(); // uid/peerUid -> name
-    const avatarPathCache = new Map();  // uid/peerUid -> local file path
-    const dndPeerMap = new Map();       // peerUid -> boolean (true if DND/muted)
+    const contactNameCache = new Map();
+    const avatarPathCache = new Map();
+    const dndPeerMap = new Map();
     let lastMsgMeta = { peerUid: '', peerName: '', at: 0 };
 
-    let loggedSamplePicElement = false;
+    // ---------------------------------------------------------------------
+    // Local HTTP IPC with Tray
+    // ---------------------------------------------------------------------
+    function buildAuthHeaders(extra) {
+      const headers = Object.assign({}, extra || {});
+      const token = getAuthToken();
+      if (token) {
+        headers['X-Auth-Token'] = token;
+      }
+      return headers;
+    }
 
+    function postToTray(endpoint, payload) {
+      try {
+        const data = Buffer.from(JSON.stringify(payload), 'utf8');
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: getTrayPort(),
+          path: endpoint,
+          method: 'POST',
+          headers: buildAuthHeaders({
+            'Content-Type': 'application/json; charset=utf-8',
+            'Content-Length': data.length
+          }),
+          timeout: 2000
+        }, (res) => {
+          res.resume();
+        });
+        req.on('error', () => {});
+        req.write(data);
+        req.end();
+      } catch (e) {}
+    }
+
+    // ---------------------------------------------------------------------
+    // Rich media & message element parsing
+    // ---------------------------------------------------------------------
     function findValidLocalPath(pic) {
       if (!pic) return '';
       if (pic.sourcePath && typeof pic.sourcePath === 'string' && fs.existsSync(pic.sourcePath)) {
@@ -115,28 +259,6 @@
       return '';
     }
 
-    function postToTray(endpoint, payload) {
-      try {
-        const data = Buffer.from(JSON.stringify(payload), 'utf8');
-        const req = http.request({
-          hostname: '127.0.0.1',
-          port: TRAY_PORT,
-          path: endpoint,
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json; charset=utf-8',
-            'Content-Length': data.length
-          },
-          timeout: 2000
-        }, (res) => {
-          res.resume();
-        });
-        req.on('error', () => {});
-        req.write(data);
-        req.end();
-      } catch (e) {}
-    }
-
     function formatElements(elements) {
       if (!Array.isArray(elements)) return { text: '', isAtMe: false };
       const parts = [];
@@ -148,7 +270,6 @@
           if (el.textElement.content) {
             parts.push(el.textElement.content);
           }
-          // Check if @me (atType: 1 = @All, 2 = @Specific user)
           const atType = Number(el.textElement.atType || 0);
           const atNtUid = String(el.textElement.atNtUid || '');
           const atUid = String(el.textElement.atUid || '');
@@ -182,11 +303,9 @@
     }
 
     async function resolveContactName(chatType, peerUid, senderUid, msg) {
-      // 1. Check direct fields on msg
       let sName = msg.sendRemarkName || msg.sendMemberName || msg.sendNickName || contactNameCache.get(senderUid) || '';
       let pName = msg.peerName || contactNameCache.get(peerUid) || '';
 
-      // 2. Try BuddyService synchronous/async methods for C2C friend name
       if (!sName && senderUid) {
         try {
           if (buddyServiceInstance) {
@@ -216,12 +335,12 @@
         } catch (e) {}
       }
 
-      if (sName && senderUid) contactNameCache.set(senderUid, sName);
-      if (pName && peerUid) contactNameCache.set(peerUid, pName);
+      if (sName && senderUid) setBounded(contactNameCache, senderUid, sName, 2000);
+      if (pName && peerUid) setBounded(contactNameCache, peerUid, pName, 2000);
 
       if (chatType === 1) {
         const finalName = sName || pName || contactNameCache.get(peerUid) || (msg.senderUin ? String(msg.senderUin) : 'QQ好友');
-        if (finalName !== 'QQ好友') contactNameCache.set(peerUid, finalName);
+        if (finalName !== 'QQ好友') setBounded(contactNameCache, peerUid, finalName, 2000);
         return { senderName: finalName, peerName: finalName };
       } else {
         return {
@@ -231,7 +350,9 @@
       }
     }
 
-    let loggedSampleMsg = false;
+    // ---------------------------------------------------------------------
+    // Incoming message pipeline
+    // ---------------------------------------------------------------------
     async function handleIncomingMsgList(msgList, sourceTag, isActiveEvent) {
       if (!Array.isArray(msgList)) return;
       const nowSec = Math.floor(Date.now() / 1000);
@@ -239,12 +360,6 @@
       for (const msg of msgList) {
         try {
           if (!msg || !msg.msgId) continue;
-          if (!loggedSampleMsg) {
-            loggedSampleMsg = true;
-            const copy = Object.assign({}, msg);
-            delete copy.elements;
-            log('Sample raw msg fields (' + sourceTag + '):', copy);
-          }
           const msgIdStr = String(msg.msgId);
 
           const msgTime = Number(msg.msgTime || 0);
@@ -270,26 +385,19 @@
           const { text: content, isAtMe } = formatElements(msg.elements);
           if (!content) continue;
 
-          // Cache names if present on msg
-          if (msg.peerName && peerUid) contactNameCache.set(peerUid, msg.peerName);
+          if (msg.peerName && peerUid) setBounded(contactNameCache, peerUid, msg.peerName, 2000);
           if ((msg.sendRemarkName || msg.sendNickName) && msg.senderUid) {
-            contactNameCache.set(msg.senderUid, msg.sendRemarkName || msg.sendNickName);
+            setBounded(contactNameCache, msg.senderUid, msg.sendRemarkName || msg.sendNickName, 2000);
           }
 
-          // DND filtering logic:
-          // For group chats (chatType === 2):
-          // NTQQ only fires `onRecvActiveMsg` (isActiveEvent === true) for NON-muted groups!
-          // Muted (免打扰) groups only fire `onRecvMsg` (isActiveEvent === false).
-          // So if chatType === 2 and !isActiveEvent and !isAtMe, it is a muted/DND group message -> skip!
+          // DND filtering: muted groups only emit onRecvMsg, not onRecvActiveMsg
           if (chatType === 2 && !isActiveEvent && !isAtMe) {
             continue;
           }
-          // Also check explicit dndPeerMap from RecentContact list
           if (dndPeerMap.get(peerUid) === true && !isAtMe) {
             continue;
           }
 
-          // Deduplicate across channels once it passes the active/atMe filter
           if (seenMsgIds.has(msgIdStr)) continue;
           seenMsgIds.add(msgIdStr);
           if (seenMsgIds.size > 500) {
@@ -313,6 +421,7 @@
                 const targetUid = chatType === 1 ? (msg.senderUid || peerUid) : peerUid;
                 avatarPath = avatarServiceInstance.getAvatarPath(targetUid, 0, false) || '';
               }
+              if (avatarPath) setBounded(avatarPathCache, peerUid, avatarPath, 2000);
             }
           } catch (e) {}
 
@@ -321,19 +430,6 @@
           if (Array.isArray(msg.elements)) {
             for (const el of msg.elements) {
               if (el && el.picElement) {
-                if (!loggedSamplePicElement) {
-                  loggedSamplePicElement = true;
-                  try {
-                    const picCopy = {};
-                    for (const k of Object.keys(el.picElement)) {
-                      const v = el.picElement[k];
-                      if (Buffer.isBuffer(v)) picCopy[k] = `<Buffer ${v.length}>`;
-                      else if (v instanceof Map) picCopy[k] = `Map(${v.size})`;
-                      else picCopy[k] = v;
-                    }
-                    log('Sample picElement structure:', picCopy);
-                  } catch (e) {}
-                }
                 imagePath = await extractImagePath(el.picElement, msg, el);
                 if (imagePath) {
                   break;
@@ -344,7 +440,11 @@
             }
           }
 
-          log(`Notify msg (${sourceTag}) [chatType=${chatType}, atMe=${isAtMe}] from ${senderName} (peer=${peerName}, uid=${peerUid}, img=${imagePath ? 'yes' : 'no'}): ${content}`);
+          if (isVerboseLog()) {
+            log(`Notify (${sourceTag}) [chatType=${chatType}, atMe=${isAtMe}] peer=${peerName}(${peerUid}) img=${imagePath ? 'yes' : 'no'}: ${content}`);
+          } else {
+            log(`Notify (${sourceTag}) [chatType=${chatType}, atMe=${isAtMe}] peerUid=${peerUid} img=${imagePath ? 'yes' : 'no'} len=${content.length}`);
+          }
 
           postToTray('/notify', {
             msgId: msgIdStr,
@@ -359,18 +459,17 @@
             isImageUpdate: false
           });
 
-          // Background async retry for real QQ image downloading (if > 600ms)
+          // Background retry for slow image thumbnail downloads
           if (!imagePath && pendingPicEl && pendingPicEl.picElement) {
             const targetPicEl = pendingPicEl.picElement;
             let checkCount = 0;
-            const maxChecks = 6;
             const timer = setInterval(() => {
               checkCount++;
               try {
                 const asyncPath = findValidLocalPath(targetPicEl);
                 if (asyncPath) {
                   clearInterval(timer);
-                  log(`Async image downloaded for ${msgIdStr}: ${asyncPath}`);
+                  log(`Async image ready for msgId=${msgIdStr}`);
                   postToTray('/notify', {
                     msgId: msgIdStr,
                     chatType: chatType,
@@ -386,7 +485,7 @@
                   return;
                 }
               } catch (e) {}
-              if (checkCount >= maxChecks) {
+              if (checkCount >= 8) {
                 clearInterval(timer);
               }
             }, 400);
@@ -397,6 +496,9 @@
       }
     }
 
+    // ---------------------------------------------------------------------
+    // NTQQ Kernel listeners & DND synchronization
+    // ---------------------------------------------------------------------
     function attachCustomMsgListener(svc) {
       if (!svc || kernelListenerId !== null) return;
       try {
@@ -447,14 +549,11 @@
         });
 
         kernelListenerId = svc.addKernelMsgListener(keptListenerRef);
-        log('Registered KernelMsgListener! listenerId =', kernelListenerId);
+        log('Registered KernelMsgListener id =', kernelListenerId);
       } catch (e) {
         log('attachCustomMsgListener error:', e.message);
       }
     }
-
-    let loggedRecentSample = false;
-    let loggedGroupSample = false;
 
     function processContactList(list, source) {
       if (!Array.isArray(list) || list.length === 0) return;
@@ -466,8 +565,8 @@
         if (!c.peerUid) continue;
         const uid = String(c.peerUid);
         const name = c.remark || c.peerName || c.sendNickName;
-        if (name) contactNameCache.set(uid, String(name));
-        if (c.avatarPath) avatarPathCache.set(uid, String(c.avatarPath));
+        if (name) setBounded(contactNameCache, uid, String(name), 2000);
+        if (c.avatarPath) setBounded(avatarPathCache, uid, String(c.avatarPath), 2000);
 
         const cType = Number(c.chatType || 0);
         const shield = Number(c.shieldFlag || 0);
@@ -485,19 +584,13 @@
       }
     }
 
-    function processGroupList(groupList, source) {
+    function processGroupList(groupList) {
       if (!Array.isArray(groupList) || groupList.length === 0) return;
-      if (!loggedGroupSample && groupList.length > 2) {
-        loggedGroupSample = true;
-        const summary = groupList.map(g => `${g.groupCode}(${g.groupName}):mask=${g.cmdUinMsgMask}`);
-        log(`GroupList full summary (${source}, total=${groupList.length}):`, summary);
-      }
       for (const g of groupList) {
         if (!g || !g.groupCode) continue;
         const gCode = String(g.groupCode);
-        if (g.groupName) contactNameCache.set(gCode, String(g.groupName));
-        if (g.remarkName) contactNameCache.set(gCode, String(g.remarkName));
-        // In NTQQ GroupSimpleInfo: cmdUinMsgMask: 1 = normal notify, 2/3/4 = assistant / shield / mute (receive without alert)
+        if (g.groupName) setBounded(contactNameCache, gCode, String(g.groupName), 2000);
+        if (g.remarkName) setBounded(contactNameCache, gCode, String(g.remarkName), 2000);
         const mask = Number(g.cmdUinMsgMask || g.msgMask || 0);
         if (mask === 1) {
           dndPeerMap.set(gCode, false);
@@ -514,7 +607,7 @@
       try {
         const target = {
           onGroupListUpdate(updateType, groupList) {
-            processGroupList(groupList, 'KernelGroupListener.onGroupListUpdate');
+            processGroupList(groupList);
           }
         };
         keptGroupListenerRef = new Proxy(target, {
@@ -523,7 +616,7 @@
             if (typeof prop === 'string' && prop.startsWith('on')) {
               return function (...args) {
                 if (prop === 'onGroupListUpdate') {
-                  processGroupList(args[1] || args[0], 'KernelGroupProxy.onGroupListUpdate');
+                  processGroupList(args[1] || args[0]);
                 }
               };
             }
@@ -535,7 +628,7 @@
           }
         });
         groupListenerId = gSvc.addKernelGroupListener(keptGroupListenerRef);
-        log('Registered KernelGroupListener! id =', groupListenerId);
+        log('Registered KernelGroupListener id =', groupListenerId);
       } catch (e) {
         log('attachGroupListener err:', e.message);
       }
@@ -593,22 +686,11 @@
               try {
                 if (typeof sess.getAvatarService === 'function') avatarServiceInstance = sess.getAvatarService();
                 if (typeof sess.getBuddyService === 'function') buddyServiceInstance = sess.getBuddyService();
-                if (typeof sess.getGroupService === 'function') {
-                  groupServiceInstance = sess.getGroupService();
-                  if (groupServiceInstance) {
-                    const gProto = Object.getOwnPropertyNames(Object.getPrototypeOf(groupServiceInstance) || {});
-                    log('GroupService methods:', gProto.filter(k => k.toLowerCase().includes('mask') || k.toLowerCase().includes('group') || k.toLowerCase().includes('list')));
-                  }
-                }
-                if (typeof sess.getRecentContactService === 'function') {
-                  recentContactServiceInstance = sess.getRecentContactService();
-                  if (recentContactServiceInstance) {
-                    const rProto = Object.getOwnPropertyNames(Object.getPrototypeOf(recentContactServiceInstance) || {});
-                    log('RecentContactService methods:', rProto);
-                  }
-                }
+                if (typeof sess.getProfileService === 'function') profileServiceInstance = sess.getProfileService();
+                if (typeof sess.getGroupService === 'function') groupServiceInstance = sess.getGroupService();
+                if (typeof sess.getRecentContactService === 'function') recentContactServiceInstance = sess.getRecentContactService();
               } catch (e) {}
-              log(`Acquired active session & services via getNTWrapperSession(${JSON.stringify(key)})!`);
+              log(`Acquired NTQQ kernel session via key=${JSON.stringify(key)}`);
               attachCustomMsgListener(svc);
               if (groupServiceInstance) attachGroupListener(groupServiceInstance);
               inspectDndSettings();
@@ -623,7 +705,7 @@
     }
 
     async function sendReplyMessage(chatType, peerUid, textContent) {
-      log(`Attempting sendReplyMessage -> chatType=${chatType}, peerUid=${peerUid}, text=${textContent}`);
+      log(`Sending quick reply -> chatType=${chatType}, peerUid=${peerUid}, len=${String(textContent || '').length}`);
       const svc = tryAcquireKernelMsgService();
       const peer = {
         chatType: Number(chatType),
@@ -646,13 +728,11 @@
 
       if (svc && typeof svc.sendMsg === 'function') {
         try {
-          const res = await svc.sendMsg('0', peer, elements, new Map());
-          log('sendMsg (4 args) result:', res);
+          await svc.sendMsg('0', peer, elements, new Map());
           return true;
         } catch (e1) {
           try {
-            const res2 = await svc.sendMsg('0', peer, elements);
-            log('sendMsg (3 args) result:', res2);
+            await svc.sendMsg('0', peer, elements);
             return true;
           } catch (e2) {
             log('sendMsg failed:', e2.message);
@@ -662,6 +742,7 @@
       return false;
     }
 
+    // Hook wrapper.node loading to capture NTQQ kernel API
     const origDlopen = process.dlopen;
     process.dlopen = function (moduleObj, filename, ...rest) {
       const ret = origDlopen.call(this, moduleObj, filename, ...rest);
@@ -676,13 +757,11 @@
       return ret;
     };
 
+    // ---------------------------------------------------------------------
+    // Native Electron notification capture & click reuse
+    // ---------------------------------------------------------------------
     let lastTrayAliveMs = 0;
-
-    // QQ 自己弹出的 Electron 通知被我们拦截不显示，但它的 click 监听器
-    // 正是 QQ 原生“点击通知跳转会话”的实现。这里保存对象引用，等用户点击
-    // 我们的快捷回复通知时，直接触发它，复用 QQ 自己的跳转逻辑。
     const nativeNotifications = [];
-    let nativeDetailLogs = 0;
 
     function associateNativeNotifications(peerUid, peerName, atMs) {
       if (!peerUid || !atMs) return;
@@ -692,7 +771,6 @@
         const delta = Math.abs(rec.ts - atMs);
         if (delta > 5000) continue;
         const prevDelta = rec.assocAt ? Math.abs(rec.ts - rec.assocAt) : Infinity;
-        // 以“离通知时间最近的那条消息”为准，被更近的消息覆盖。
         if (!rec.peerUid || delta < prevDelta) {
           rec.peerUid = peerUid;
           rec.peerName = peerName || rec.peerName;
@@ -713,7 +791,6 @@
           title: String(n.title || ''),
           body: String(n.body || ''),
           tag: String(n.tag || ''),
-          hasReply: !!n.hasReply,
           clickListeners: (typeof n.listenerCount === 'function') ? n.listenerCount('click') : -1,
           ref: n
         };
@@ -721,52 +798,17 @@
         while (nativeNotifications.length > 30) {
           nativeNotifications.shift();
         }
-        log('Captured native notification: ' + JSON.stringify({
-          title: record.title, body: record.body, tag: record.tag,
-          hasReply: record.hasReply, clickListeners: record.clickListeners,
-          peerUid: record.peerUid, peerName: record.peerName
-        }));
-
-        // 诊断信息：QQ 的通知 title/body 为空，但对象上可能有 toastXml
-        // 或自定义属性；click 监听器的源码能直接看出 QQ 原生跳转用了什么参数。
-        if (nativeDetailLogs < 10) {
-          nativeDetailLogs++;
-          let own = [];
-          let proto = [];
-          let toastXml = '';
-          let listenerSource = '';
-          try { own = Object.getOwnPropertyNames(n); } catch (e) {}
-          try { proto = Object.getOwnPropertyNames(Object.getPrototypeOf(n) || {}); } catch (e) {}
-          try {
-            if (typeof n.toastXml === 'function') toastXml = String(n.toastXml());
-            else if (typeof n.toastXml === 'string') toastXml = n.toastXml;
-          } catch (e) {}
-          try {
-            const listeners = n.listeners('click');
-            if (listeners && listeners.length > 0) {
-              listenerSource = String(listeners[0]).slice(0, 1500);
-            }
-          } catch (e) {}
-          log('Native notification details: ' + JSON.stringify({
-            own: own, proto: proto, peerUid: record.peerUid, peerName: record.peerName,
-            toastXml: String(toastXml || '').slice(0, 1500), listenerSource: listenerSource
-          }));
-        }
       } catch (e) {}
     }
 
     function emitNativeNotificationClick(item) {
-      if (nativeNotifications.length === 0) {
-        log('No captured native notification to click.');
-        return false;
-      }
+      if (nativeNotifications.length === 0) return false;
 
       const peerUid = String((item && item.peerUid) || '');
       const name = String((item && item.peerName) || '').trim();
       const now = Date.now();
       let pick = null;
 
-      // 1) 优先按“消息 -> 通知”的时间关联匹配 peerUid（QQ 通知的 title/body 是空的）
       if (peerUid) {
         for (let i = nativeNotifications.length - 1; i >= 0; i--) {
           const rec = nativeNotifications[i];
@@ -778,7 +820,6 @@
         }
       }
 
-      // 2) 退化匹配：标题/正文/记录中的会话名
       if (!pick && name) {
         for (let i = nativeNotifications.length - 1; i >= 0; i--) {
           const rec = nativeNotifications[i];
@@ -792,28 +833,15 @@
         }
       }
 
-      if (!pick) {
-        log('No matching native notification for peerUid=' + peerUid + ', peerName=' + name + '; skip native click.');
-        return false;
-      }
+      if (!pick) return false;
 
       try {
         const count = (typeof pick.ref.listenerCount === 'function') ? pick.ref.listenerCount('click') : 0;
-        let source = '';
-        try {
-          const listeners = pick.ref.listeners('click');
-          if (listeners && listeners.length > 0) source = String(listeners[0]).slice(0, 500);
-        } catch (e) {}
-        log('Emitting native notification click: matchedPeerUid=' + pick.peerUid +
-            ', matchedPeerName=' + pick.peerName + ', ageMs=' + (now - pick.ts) +
-            ', listeners=' + count + ', source=' + source);
-        if (count <= 0) {
-          return false;
-        }
+        if (count <= 0) return false;
         pick.ref.emit('click', {});
         return true;
       } catch (e) {
-        log('emitNativeNotificationClick error: ' + e.message);
+        log('emitNativeNotificationClick error:', e.message);
         return false;
       }
     }
@@ -823,7 +851,6 @@
       const cmd = String(item.cmdName || item.callbackId || '');
       const payload = item.payload;
 
-      // 1. Recent contact list updates contain peerName, remark, and notDisturb/msgMask!
       if (cmd.includes('onRecentContactListChanged') || cmd.includes('onRecentContact')) {
         const list = (payload && payload[0] && payload[0].changedList) || (payload && payload.changedList);
         if (Array.isArray(list)) {
@@ -831,15 +858,13 @@
         }
       }
 
-      // 1b. Group list updates contain groupCode, groupName, cmdUinMsgMask
       if (cmd.includes('onGroupListUpdate') || cmd.includes('GroupList')) {
         const gList = (payload && payload[0] && payload[0].groupList) || (payload && payload.groupList) || (payload && payload[1]);
         if (Array.isArray(gList)) {
-          processGroupList(gList, 'IPC:' + cmd);
+          processGroupList(gList);
         }
       }
 
-      // 2. Active / incoming messages
       if (cmd.includes('onRecvActiveMsg')) {
         const msgList = (payload && payload[0] && payload[0].msgList) || (payload && payload.msgList);
         if (Array.isArray(msgList)) {
@@ -876,16 +901,12 @@
       if (electronHooked || !electron || !electron.app) return;
       electronHooked = true;
 
-      // Suppress duplicate native Electron Notification when QQToastTray is active
       try {
         if (electron.Notification && electron.Notification.prototype) {
           const origShow = electron.Notification.prototype.show;
           electron.Notification.prototype.show = function (...args) {
-            // Capture the object before deciding to suppress it: its click
-            // listener is QQ's own "open the right conversation" handler.
             captureNativeNotification(this);
-            if (Date.now() - lastTrayAliveMs < 5000) {
-              log('Suppressed duplicate native Electron Notification');
+            if (Date.now() - lastTrayAliveMs < 5000 && getConfigValue('Enabled', true, false) !== false) {
               return;
             }
             return origShow.apply(this, args);
@@ -933,16 +954,7 @@
     };
 
     // ---------------------------------------------------------------------
-    // Open-chat support
-    //
-    // NTQQ keeps several hidden Electron BrowserWindows alive (the 800x600
-    // login/helper window, the 720x640 auxiliary window, the tiny tray host...).
-    // The old code simply showed the first window larger than 400x400, which
-    // popped up a blank grey helper window instead of the QQ main window.
-    // We now pick the real main window by URL (#/main/message), never by size
-    // alone. We also never call the native jump API directly any more: on this
-    // QQ version it cleared the active conversation and produced a blank chat
-    // pane. Instead we replay QQ's own notification click handler when possible.
+    // Safe main-window activation (avoids blank #/blank helper window)
     // ---------------------------------------------------------------------
     function describeWindow(win) {
       try {
@@ -951,17 +963,15 @@
         try { url = win.webContents && win.webContents.getURL ? String(win.webContents.getURL() || '') : ''; } catch (e) {}
         return {
           id: win.id,
-          title: (win.getTitle ? win.getTitle() : '') || '',
           width: bounds.width || 0,
           height: bounds.height || 0,
           visible: win.isVisible ? win.isVisible() : false,
-          minimized: win.isMinimized ? win.isMinimized() : false,
           resizable: win.isResizable ? win.isResizable() : false,
           minimizable: win.isMinimizable ? win.isMinimizable() : false,
           url: url
         };
       } catch (e) {
-        return { id: -1, title: '', width: 0, height: 0, visible: false, minimized: false, resizable: false, minimizable: false, url: '' };
+        return { id: -1, width: 0, height: 0, visible: false, resizable: false, minimizable: false, url: '' };
       }
     }
 
@@ -974,10 +984,6 @@
         return true;
       });
 
-      log('openChat candidate windows:', infos.map(x => x.info));
-
-      // 通过 URL 精确识别主窗口，避免把 #/blank 的空白辅助窗口或
-      // #/chat 的独立聊天池窗口当主窗口显示出来。
       const isBlankHelper = (url) => /#\/blank/i.test(url) || /chatPoolWin=1/i.test(url);
       const isMainPage = (url) => /#\/main(\/|$)/i.test(url) || /\/main\/message/i.test(url);
 
@@ -985,12 +991,8 @@
       if (pool.length === 0) {
         pool = infos.filter(x => !isBlankHelper(x.info.url));
       }
-      if (pool.length === 0) {
-        return null; // 宁可触发 QQ 自身的激活逻辑，也不要显示空白辅助窗口
-      }
+      if (pool.length === 0) return null;
 
-      // Prefer windows that are actually resizable (QQ main window). Hidden
-      // helper/login windows are usually fixed-size and much smaller.
       pool.sort((a, b) => {
         if (a.info.resizable !== b.info.resizable) return a.info.resizable ? -1 : 1;
         if (a.info.minimizable !== b.info.minimizable) return a.info.minimizable ? -1 : 1;
@@ -1000,15 +1002,9 @@
       return pool[0].win;
     }
 
-    // QQ 有时在自动登录后并不会创建主窗口（只驻留托盘）。此时由 QQ 原生
-    // 通知的 click 回调负责创建/显示主窗口；这里不再主动启动第二个 QQ 进程，
-    // 避免出现新的登录窗口。
-
     function showMainWindow(win) {
       try {
         if (win.isMinimized && win.isMinimized()) win.restore();
-        // Always go through Electron's show(): calling Win32 ShowWindow on a
-        // BrowserWindow hidden with hide() produces a blank white/grey window.
         if (win.show) win.show();
         if (win.focus) win.focus();
         if (win.moveTop) win.moveTop();
@@ -1020,44 +1016,26 @@
       }
     }
 
-    // 从隐藏/最小化状态恢复后主动刷新一次窗口内容，避免 Chromium 合成层
-    // 偶发不重绘（历史版本出现过空白聊天区）。
     function repaintQQWindows(electron, win) {
       try {
-        let count = 0;
-        try {
-          const all = electron.webContents.getAllWebContents();
-          for (const wc of all) {
-            try {
-              if (wc && !wc.isDestroyed() && typeof wc.invalidate === 'function') {
-                wc.invalidate();
-                count++;
-              }
-            } catch (e) {}
-          }
-        } catch (e) {}
-        try {
-          if (win.webContents && typeof win.webContents.invalidate === 'function') {
-            win.webContents.invalidate();
-            count++;
-          }
-        } catch (e) {}
-        log('Repaint: invalidated ' + count + ' webContents.');
-      } catch (e) {
-        log('repaintQQWindows error: ' + e.message);
-      }
+        const all = electron.webContents.getAllWebContents();
+        for (const wc of all) {
+          try {
+            if (wc && !wc.isDestroyed() && typeof wc.invalidate === 'function') wc.invalidate();
+          } catch (e) {}
+        }
+        if (win.webContents && typeof win.webContents.invalidate === 'function') {
+          win.webContents.invalidate();
+        }
+      } catch (e) {}
     }
 
     function handleOpenChat(item) {
-      log('Handling openChat for peerUid=' + item.peerUid + ', chatType=' + item.chatType + ', peerName=' + item.peerName);
       const nativeClicked = emitNativeNotificationClick(item);
-      log('Native notification click emitted=' + nativeClicked);
       try {
         let electron = null;
         try { electron = require('electron'); } catch (e) {}
-
         if (!electron || !electron.BrowserWindow || typeof electron.BrowserWindow.getAllWindows !== 'function') {
-          log('Electron BrowserWindow API unavailable.');
           return;
         }
 
@@ -1065,76 +1043,33 @@
           setTimeout(() => {
             try {
               const w = pickQQMainWindow(electron);
-              if (!w) {
-                log('QQ main window is not available.');
-                return;
-              }
-              const info = describeWindow(w);
+              if (!w) return;
               showMainWindow(w);
               repaintQQWindows(electron, w);
               setTimeout(() => { try { repaintQQWindows(electron, w); } catch (e) {} }, 450);
-              log('Ensured QQ main window: ' + JSON.stringify(info));
-            } catch (e) {
-              log('ensureQQWindow error: ' + e.message);
-            }
+            } catch (e) {}
           }, delayMs);
         };
 
         if (nativeClicked) {
-          // 先让 QQ 自己的通知点击逻辑完成打开/跳转，稍后再兜底确保窗口可见。
-          log('QQ native notification click emitted; QQ handles window and conversation switch.');
           ensureQQWindow(600);
           return;
         }
 
         const win = pickQQMainWindow(electron);
         if (win) {
-          const info = describeWindow(win);
           showMainWindow(win);
-          log('Showed QQ main window: ' + JSON.stringify(info) + ', wasHidden=' + !info.visible);
           repaintQQWindows(electron, win);
           setTimeout(() => { try { repaintQQWindows(electron, win); } catch (e) {} }, 450);
-          log('Opened QQ main window without forcing a conversation switch.');
-          return;
         }
-
-        log('No main window and no native notification click available; nothing to open.');
       } catch (eWin) {
-        log('handleOpenChat error: ' + eWin.message);
+        log('handleOpenChat error:', eWin.message);
       }
     }
 
     // ---------------------------------------------------------------------
-    // Tray auto-launch (follow QQ startup)
+    // Tray auto-launch & heartbeat polling
     // ---------------------------------------------------------------------
-    function readConfigSafely() {
-      try {
-        if (!fs.existsSync(CONFIG_FILE)) return null;
-        // .NET's Encoding.UTF8 used to write a BOM here; JSON.parse() chokes
-        // on it and the old code silently fell back to "follow=true".
-        let raw = fs.readFileSync(CONFIG_FILE, 'utf8');
-        if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
-        raw = raw.replace(/^\uFEFF/, '').trim();
-        if (!raw) return null;
-        return JSON.parse(raw);
-      } catch (e) {
-        return null;
-      }
-    }
-
-    function getConfigBool(name, defaultValue) {
-      // Retry once: the tray may be rewriting config.json at this exact moment.
-      for (let attempt = 0; attempt < 2; attempt++) {
-        const cfg = readConfigSafely();
-        if (cfg && typeof cfg === 'object') {
-          const key = Object.keys(cfg).find(k => String(k).toLowerCase() === name.toLowerCase());
-          if (key !== undefined) return cfg[key] !== false;
-          return defaultValue;
-        }
-      }
-      return defaultValue;
-    }
-
     function userQuitTraySinceBridgeStart() {
       try {
         if (!fs.existsSync(EXIT_FLAG_FILE)) return false;
@@ -1143,7 +1078,6 @@
         if (!isNaN(flagMs)) {
           return flagMs > BRIDGE_START_MS;
         }
-        // Fallback for legacy/empty flag files: compare mtime.
         return fs.statSync(EXIT_FLAG_FILE).mtimeMs > BRIDGE_START_MS;
       } catch (e) {
         return false;
@@ -1155,18 +1089,12 @@
 
     function tryAutoLaunchTray() {
       try {
-        // Respect the tray's "跟随 QQ 启动自动运行" switch. It must be re-read
-        // on every attempt so toggling it off takes effect immediately.
-        if (!getConfigBool('FollowQQStartup', true)) {
+        if (getConfigValue('FollowQQStartup', true, true) === false) {
           return;
         }
-
-        // The user explicitly chose "退出程序" during this QQ session:
-        // stay quit instead of resurrecting the tray on every poll failure.
         if (userQuitTraySinceBridgeStart()) {
           return;
         }
-
         const now = Date.now();
         if (now - lastTrayLaunchAttemptMs < 15000) {
           return;
@@ -1175,7 +1103,7 @@
 
         const trayExePath = path.join(__dirname, 'QQToastTray.exe');
         if (fs.existsSync(trayExePath)) {
-          log('QQToastTray not responding, auto-launching QQToastTray.exe...');
+          log('Tray not responding; auto-launching QQToastTray.exe');
           const child_process = require('child_process');
           const cp = child_process.spawn(trayExePath, [], {
             cwd: __dirname,
@@ -1199,16 +1127,21 @@
         } else if (dndPeerMap.size === 0 && pollTicks % 5 === 0) {
           inspectDndSettings();
         }
-        // CRITICAL: Only the main NTQQ process that actually holds msgServiceInstance
-        // is allowed to poll /poll! Otherwise a child/helper process without wrapper.node
-        // will steal and discard pending replies from the queue!
         if (!msgServiceInstance) {
           return;
         }
+
+        const qs =
+          `?qqVersion=${encodeURIComponent(RUNNING_QQ_VERSION)}` +
+          `&loader=${encodeURIComponent(LOADER_STATUS)}` +
+          `&dndCount=${dndPeerMap.size}` +
+          `&bridgeVer=${BRIDGE_VERSION}`;
+
         const req = http.get({
           hostname: '127.0.0.1',
-          port: TRAY_PORT,
-          path: '/poll',
+          port: getTrayPort(),
+          path: '/poll' + qs,
+          headers: buildAuthHeaders(),
           timeout: 1500
         }, (res) => {
           consecutivePollFails = 0;
@@ -1239,6 +1172,5 @@
         });
       } catch (e) {}
     }, 1000);
-
   } catch (e) {}
 })();

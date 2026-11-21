@@ -1,0 +1,47 @@
+name: Build and Release NTQQ_Response
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify MinGW gcc and .NET Framework csc
+        shell: pwsh
+        run: |
+          gcc --version
+          Test-Path "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+
+      - name: Build and package release artifacts
+        shell: pwsh
+        run: |
+          .\scripts\package-release.ps1
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: NTQQ_Response-dist
+          path: |
+            release/NTQQ_Response_Setup_v*.exe
+            release/NTQQ_Response_Portable_v*.zip
+            release/SHA256SUMS_v*.txt
+
+      - name: Create GitHub Release (on tag push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/NTQQ_Response_Setup_v*.exe
+            release/NTQQ_Response_Portable_v*.zip
+            release/SHA256SUMS_v*.txt
+          generate_release_notes: true

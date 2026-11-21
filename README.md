@@ -1,173 +1,123 @@
-# NTQQ_Response v1.1.1（QQ Windows 11 系统级快捷回复助手）
+# NTQQ_Response v1.2.0（QQ Windows 11 系统级快捷回复助手）
 
-针对新版 Windows **NTQQ（9.9.x）** 的轻量级 Windows 11 原生 Toast 通知快捷回复插件与托盘助手。无需切出当前工作，即可在系统右下角通知横幅里直接打字回消息。
+针对新版 Windows **NTQQ（9.9.x）** 的轻量级 Windows 11 原生 Toast 通知快捷回复插件与 Fluent 托盘助手。无需切出当前工作，即可在系统右下角原生通知横幅里直接打字回消息。
 
-> 当前版本：**v1.1.1** · 适用：Windows 10/11 x64 + NTQQ 9.9.x
+> 当前版本：**v1.2.0** · 适用：Windows 10/11 x64 + NTQQ 9.9.x · 零额外运行时依赖（仅 ~170 KB）
 
 ---
 
 ## ✨ 核心特性
 
-- **💬 通知横幅内直接回复**：基于 Windows 11 原生 `ToastNotification` 输入框 + `INotificationActivationCallback` COM 激活协议，回车即发，不抢焦点。
-- **📜 打字中新消息“原位追加”**：同一会话连续来消息时，用 `ToastNotifier.Update` + `NotificationData` 在通知里滚动追加，**不会清空你正在输入的文字**。
-- **🔝 智能堆叠与字数控制**：最新消息优先，托盘可调堆叠条数（1–4 条）与单条字数上限（30/50/80 字），避免最新消息被旧消息挤出可视区。
-- **🖼️ 图片缩略图内联展示**：好友/群里发来图片时，通知卡片内直接渲染缩略图。
-- **🖱️ 点击通知打开 QQ 主窗口（v1.1.1 修复空白界面）**：
-  - 点击横幅会唤醒并置顶 QQ 主窗口；
-  - 会优先复用 QQ **原生通知自身的点击回调**来定位会话（QQ 自己跳转最可靠）；
-  - 如果当前 QQ 版本无法安全定位，就只打开主窗口并保留你原来的会话，**不再强行跳转导致空白/清空会话**。
-- **🚀 跟随 QQ 启动自动运行**：QQ 启动后由内核桥接自动拉起托盘助手，不需要计划任务。
-- **🔕 严格遵循 QQ 免打扰**：自动同步 `GroupService` / `RecentContactService` 的免打扰掩码；免打扰群仅在 `@我`、`@全体成员` 或回复我时提醒。
-- **🚫 自动屏蔽 QQ 原生重复弹窗**：拦截 Electron 原生通知 + 系统通知注册表静默，避免双份通知；退出或卸载时自动恢复 QQ 原生通知。
-- **🪶 纯托盘驻留**：无主窗口，支持开关快捷回复、群通知、前台静默、开机自启、修复/卸载桥接。
-- **🛡️ 不修改 QQ 原版文件**：不碰 `application.asar`、`package.json`、`QQNT.dll` 磁盘文件，通过 `version.dll` 代理与内存补丁引导，保留 NTQQ 官方签名校验。
+- **💬 Windows 11 原生通知横幅直接回复**：基于 `ToastNotification` 输入框 + `INotificationActivationCallback` COM 激活协议，完全贴合系统视觉风格，回车即发，不抢焦点。
+- **📜 打字中新消息“原位追加”**：同一会话连续来消息时，使用 `ToastNotifier.Update` + `NotificationData` 滚动追加，**不清空正在输入的文字**。
+- **🎨 Win11 Fluent 托盘控制中心（v1.2.0 新增）**：
+  - **左键单击托盘图标**弹出贴合任务栏的 Fluent 控制面板，自动跟随系统浅色/深色主题与 Win11 圆角样式；
+  - 实时显示 NTQQ 连接状态、当前运行版本、热更新版本同步状态、免打扰规则数；
+  - 内置现代化 Toggle 开关、堆叠条数（1–4 条）与单条字数（30/50/80 字）分段选择器，以及一键「预览通知」。
+- **🔄 多版本动态适配与热更新感知（v1.2.0 升级）**：
+  - `version.dll` 引导器动态解析 `QQNT.dll` 内存中的模块与路径变量名，并使用带 `try/catch` 的安全补丁，抗 NTQQ 小版本混淆变动、绝不拖垮 QQ 启动；
+  - 自动解析 NTQQ `versions\config.json` 中的当前版本与 `readyVersion` 热更新目录，后台感知新版本并支持一键同步（需要时自动申请 UAC 提权）。
+- **🖼️ 图片缩略图内联展示**：支持同步与异步下载的图片缩略图内联渲染，缓存自动清理不占磁盘。
+- **🔕 严格遵循 QQ 免打扰**：自动同步 `GroupService` / `RecentContactService` 免打扰掩码；免打扰群仅在 `@我`、`@全体成员` 或回复我时提醒。
+- **🔒 本地通信鉴权与隐私保护（v1.2.0 新增）**：
+  - 托盘与桥接间采用随机 `X-Auth-Token` 鉴权；
+  - 日志默认不记录聊天正文明文，且自动按 512 KB 轮转，排错时可按需开启详细日志。
+- **🛡️ 零修改 QQ 原版文件**：不修改 `application.asar`、`package.json`、`QQNT.dll`，保留官方签名校验；支持通过 Windows「安装的应用」标准卸载还原。
 
 ---
 
-## 🆕 v1.1.1 更新日志
+## 📦 安装与使用
 
-### 1. 修复“点击通知打开 QQ 后空白界面”
-根因有三个，全部处理：
+### 方式一：一键安装（推荐）
+1. 下载 **`release/NTQQ_Response_Setup_v1.2.0.exe`** 并双击运行。
+2. 向导自动识别本机 NTQQ 安装路径与全部版本（含热更新目录）。
+3. 点击 **“一键安装并启动”**（覆盖安装会自动保留您原有的个性化配置）。
 
-1. 旧代码用 `Process.MainWindowHandle` + Win32 `ShowWindow` 去显示 QQ 隐藏的 Electron 窗口，隐藏窗口被原生 API 强行显示后不会重绘，出现全灰/黑色空白；
-2. 旧桥接按“窗口大于 400×400”挑选窗口，会选中 `#/blank` 的 800×600 辅助窗口，显示出来就是空白窗口；
-3. 旧代码直接调用内核 `jumpToSpecifyRecentContact(Ver2)`，在该 QQ 版本上会清空当前会话状态，聊天区变成空白。
+### 方式二：便携包（手动部署）
+1. 下载 **`release/NTQQ_Response_Portable_v1.2.0.zip`** 并解压。
+2. 运行 `QQToastTray.exe`，左键点击右下角托盘图标打开控制面板。
+3. 点击「修复并重启 QQ」即可完成桥接部署。
 
-v1.1.1 的做法：
-
-- 托盘不再用 Win32 显示 QQ 窗口，只授予前台权限；
-- 桥接按 URL `#/main/message` 精确识别真正的主窗口，并排除 `#/blank`、`chatPoolWin` 辅助窗口；
-- 移除会导致空白的内核跳转调用，改为 **复用 QQ 原生通知的 click 回调**（标题/正文能匹配到目标会话时才触发）；匹配不到就只打开主窗口，保留原会话，绝不强跳。
-
-### 2. 修复“工具无法完全退出”（即使关了“跟随 QQ 启动”）
-- `config.json` 之前用带 BOM 的 UTF-8 写入，桥接 `JSON.parse` 因 BOM 抛错后回退为“跟随启动=开启”，导致退出后 2 秒又被拉起来；
-- 现在配置一律无 BOM 写入，桥接读取时也兼容并去除 BOM；
-- 新增 `tray-exit.flag`：用户主动退出后，本次 QQ 会话内桥接不再自动拉起托盘；
-- 新增 `QQToastTray.exe --exit` 优雅退出与退出事件；
-- 退出时撤销 COM 注册、关闭端口、清理通知、**恢复 QQ 原生通知**，最后强制结束进程；
-- Windows 通知中心里的旧通知再被点击时，也不会通过 COM 把托盘“复活”。
-
-### 3. 删除“体验”模块
-移除托盘菜单里的“发送多条测试通知（体验打字中实时追加）”及 `test_peer` 模拟回复相关代码，界面更干净。
-
-### 4. 安装器与版本管理
-- 安装器：先写退出标记再停止旧托盘，避免安装过程中旧桥接把托盘拉起来；安装/卸载均优雅停止托盘；卸载时清理 CLSID / AUMID 注册、开始菜单快捷方式和图片缓存；
-- 配置与 `qqtoast.js` 改为无 BOM 写入；
-- 安装器、托盘程序均写入 `1.1.1.0` 文件版本信息；
-- `build.bat` 支持自动查找 `csc.exe`，没装 gcc 时可复用已有 `version.dll`；
-- 新增 `VERSION`、`AssemblyInfo.cs` 和本次发布说明。
+### 卸载与还原
+- 可直接在 **Windows 设置 → 应用 → 安装的应用** 中搜索 `NTQQ_Response` 一键卸载；
+- 或运行安装向导点击 **“彻底卸载恢复原版”**，或在托盘右键点击 **“卸载 QQ 桥接组件”**。
 
 ---
 
-## 📦 一键安装（推荐）
+## 🖱️ 托盘操作说明
 
-1. 下载 **`NTQQ_Response_Setup_v1.1.1.exe`**（位于仓库 `release/` 目录，便携包根目录也附带一份）。
-2. 双击运行，向导会自动识别本机 NTQQ 安装路径。
-3. 点击 **“一键安装并启动”**。
-
-安装器会：
-
-- 停止旧版托盘并（按选项）重启 QQ 让桥接立即生效；
-- 把托盘助手安装到 `%LOCALAPPDATA%\QQToastTray`；
-- 向 QQ 各版本目录写入 `qqtoast.js` 与 `version.dll`；
-- 可选写入开机启动、屏蔽 QQ 原生重复通知。
-
-> 安装/卸载会短暂关闭 QQ，请先保存未发送内容。
-
-## 🗜️ 便携包（手动部署）
-
-下载 **`NTQQ_Response_Portable_v1.1.1.zip`** 并解压：
-
-1. 运行 `QQToastTray.exe`，托盘图标出现；
-2. 首次运行会自动把 `qqtoast.js` / `version.dll` 写入 QQ 的 `versions\*` 目录；
-3. 重启 QQ 使桥接生效（托盘右键 → “修复桥接并重启 QQ” 也可以）。
-
-## 🗑️ 卸载与还原
-
-- 运行 `NTQQ_Response_Setup_v1.1.1.exe` → **“彻底卸载恢复原版”**；
-- 或托盘右键 → **“卸载 QQ 桥接组件”**；
-- 卸载会删除桥接文件、恢复 QQ 原生通知、清理注册表与托盘目录，之后手动启动 QQ 即可。
+- **左键单击托盘图标**：打开 Win11 Fluent 控制面板（查看连接/版本健康度、切换所有开关、调整堆叠条数与字数、发送预览通知、同步新版本）。
+- **右键单击托盘图标**：极简快捷菜单（打开控制面板 / 启用快捷回复通知 / 修复桥接并重启 QQ / 卸载桥接 / 退出程序）。
 
 ---
 
-## 🖱️ 使用说明（托盘菜单）
+## 🛠️ 从源码编译与打包
 
-| 菜单项 | 说明 |
-| :--- | :--- |
-| 状态 | 显示是否已连接 NTQQ 内核 |
-| 启用系统级快捷回复通知 | 总开关 |
-| 接收未免打扰的群聊通知 | 群消息总开关（免打扰规则仍生效） |
-| QQ 窗口在前台时静默 | 正在用 QQ 时不再弹通知 |
-| 自动屏蔽 QQ 原生重复系统通知 | 避免双份通知；退出时自动恢复 |
-| 消息堆叠与字数上限 | 1–4 条 / 30–80 字 |
-| 跟随 QQ 启动自动运行 | QQ 启动时自动拉起托盘 |
-| 修复桥接并重启 QQ | QQ 升级后重装桥接 |
-| 卸载 QQ 桥接组件 | 还原纯净 QQ |
-| 开机自动启动 | 登录 Windows 后启动托盘 |
-| 退出程序 | **完全退出**，本次 QQ 会话不再自动拉起；QQ 通知恢复 |
-
----
-
-## ❓ 常见问题
-
-**Q：点击通知后 QQ 打开但聊天区还是空白？**
-A：确认使用的是 v1.1.1 及以上，并重启过 QQ。v1.1.1 已移除会清空会话的跳转调用；若仍出现，请把 `tray-debug.log`、`bridge-debug.log` 发给开发者。
-
-**Q：退出后托盘又自己出现了？**
-A：旧版 v1.1.0 的 `config.json` 带 BOM 导致“跟随启动”误判。v1.1.1 已修复；请升级后重新开关一次“跟随 QQ 启动自动运行”。
-
-**Q：QQ 更新后不弹通知了？**
-A：QQ 更新会替换 `version.dll`/`qqtoast.js`。重新运行安装器，或托盘右键“修复桥接并重启 QQ”。
-
-**Q：杀毒软件报毒？**
-A：本项目通过代理 `version.dll` 注入 QQ 加载桥接脚本，行为类似 DLL 劫持，容易被启发式误报。源码完全公开，可自行编译；请添加信任或用便携包手动部署。
-
-**Q：会修改 QQ 原版文件吗？**
-A：只新增 `versions\<版本>\resources\qqtoast.js` 和 `versions\<版本>\version.dll`，不修改 `application.asar`、`package.json`、`QQNT.dll`。卸载会删除这两个文件。
-
-**Q：为什么不能保证每次都跳到具体聊天？**
-A：该 QQ 版本的内核 `jumpToSpecifyRecentContact` 会清空当前会话并造成空白，得不偿失。v1.1.1 优先复用 QQ 原生通知的 click 回调来跳转；无法匹配时只打开主窗口，保证界面正常。
-
----
-
-## 🛠️ 从源码编译
-
-无需完整 Visual Studio，使用 Windows 自带的 `.NET Framework 4.x csc.exe`；`version.dll` 需要 MinGW-w64 gcc（没有 gcc 时会复用仓库内已编译的 dll）：
+无需 Visual Studio 或 .NET SDK，仅依赖 Windows 自带 `.NET Framework 4.x csc.exe` 与 MinGW-w64 `gcc`（无 `gcc` 时自动复用已有 `version.dll`）：
 
 ```bat
+:: 编译到 dist\
 build.bat
+
+:: 编译并打包发布物（Setup.exe、Portable.zip、SHA256SUMS）到 release\
+powershell -ExecutionPolicy Bypass -File scripts\package-release.ps1
 ```
 
-产物：
+### 模块化目录结构
 
-- `QQToastTray.exe` — 托盘助手
-- `QQToastSetup.exe` — 单文件安装/卸载程序
-- `version.dll` — QQ 内核桥接引导模块
-
-### 目录结构
-
-| 文件 | 说明 |
-| :--- | :--- |
-| `QQToastTray.cs` | 托盘主程序、WinRT Toast 热更新、COM 激活、退出/通知恢复 |
-| `qq-bridge.js` | NTQQ 内核消息监听、免打扰过滤、原生通知 click 复用、退出标记 |
-| `version.c` / `version.def` | 零文件修改引导模块（内存补丁加载 `qqtoast.js`） |
-| `QQToastSetup.cs` | 单文件安装/卸载向导 |
-| `AssemblyInfo.cs` | 统一版本信息（1.1.1.0） |
-| `build.bat` | 一键编译脚本 |
-| `VERSION` | 当前版本号 |
+```text
+NTQQ_Response/
+├── VERSION                          # 唯一版本号源（自动同步到 AssemblyInfo 与打包产物）
+├── build.bat                        # 模块化编译脚本（输出至 dist\）
+├── scripts/
+│   ├── sync-version.ps1             # 同步 VERSION -> AssemblyInfo.cs
+│   └── package-release.ps1          # 自动生成 Setup / Portable / SHA256SUMS
+├── .github/workflows/release.yml    # GitHub Actions 自动构建与发布工作流
+└── src/
+    ├── loader/
+    │   ├── version.c                # 线程安全动态符号适配引导模块（无 DllMain 死锁）
+    │   └── version.def              # version.dll 导出表
+    ├── bridge/
+    │   └── qq-bridge.js             # NTQQ 内核桥接 v8（鉴权、遥测上报、日志轮转、免打扰）
+    ├── tray/
+    │   ├── Program.cs               # 入口、单实例控制、--exit / --deploy-bridge 提权命令
+    │   ├── TrayAppContext.cs        # 托盘协调器、热更新巡检、无泄漏图标管理
+    │   ├── TrayFlyoutForm.cs        # Win11 Fluent 控制面板浮窗
+    │   ├── FluentControls.cs        # 高 DPI Fluent 控件与浅/深色主题
+    │   ├── ToastManager.cs          # WinRT Toast 渲染、原位追加、COM 激活、预览通知
+    │   ├── LocalHttpServer.cs       # 鉴权本地 HTTP 服务端
+    │   ├── BridgeDeployer.cs        # NTQQ 多版本检测、SHA256 校验、热更新部署与 UAC 提权
+    │   ├── ConfigStore.cs           # 无 BOM 原子配置持久化与自启管理
+    │   ├── Logger.cs                # 512 KB 自动轮转日志器
+    │   ├── NativeMethods.cs         # Win32 / DWM / COM P/Invoke 声明
+    │   └── Models.cs                # 配置与遥测数据模型
+    └── setup/
+        └── SetupForm.cs             # Fluent 安装/卸载向导（保留配置 + 注册系统卸载项）
+```
 
 ---
 
 ## 📚 版本历史
 
-| 版本 | 日期 | 说明 |
-| :--- | :--- | :--- |
-| v1.0.0 | 2026-10-22 | 首个版本：通知内快捷回复、原位追加、免打扰过滤、屏蔽重复通知 |
-| v1.1.0 | 2026-10-23 | 堆叠/字数控制、图片缩略图、点击跳转、跟随 QQ 启动 |
-| **v1.1.1** | **2026-10-23** | **修复点击后空白界面、修复无法完全退出、删除体验模块、安装器与版本管理完善** |
+| 版本 | 说明 |
+| :--- | :--- |
+| **v1.2.0** | **模块化架构重构、动态版本适配与热更新同步、Win11 Fluent 托盘控制中心、本地 IPC 鉴权与隐私日志轮转、异步图片修复、Windows 标准卸载项与 CI/CD 打包** |
+| v1.1.1 | 修复点击通知空白界面、修复无法完全退出、安装器与版本管理完善 |
+| v1.1.0 | 堆叠/字数控制、图片缩略图、点击跳转、跟随 QQ 启动 |
+| v1.0.0 | 首个版本：通知内快捷回复、原位追加、免打扰过滤、屏蔽重复通知 |
+
+---
+
+## ⚠️ 关于 Windows SmartScreen 拦截提示与安全验证
+
+从 GitHub 下载的独立 `.exe` 程序如果没有**付费商业代码签名证书（OV/EV Code Signing）**，Windows 11 会因互联网下载标记（Mark of the Web）默认弹出「Windows 已保护你的电脑」蓝屏提示：
+
+- **直接运行**：点击弹窗里的 **「更多信息」→「仍要运行」** 即可（v1.2.0 已为所有可执行文件与 `version.dll` 嵌入完整 Win32 清单与版本元信息，尽量降低误报）。
+- **零拦截本地编译（最放心）**：克隆仓库后直接双击运行 `build.bat`，调用本机 Windows 自带 `.NET Framework 4.x csc.exe` 编译，本地生成的 `.exe` 无下载标记、不会触发 SmartScreen。
+- **透明度验证**：所有发布物均附带 `SHA256SUMS_v*.txt`，并支持通过 GitHub Actions（`.github/workflows/release.yml`）云端透明构建。
 
 ---
 
 ## ⚠️ 免责声明
 
-本项目为非官方第三方工具，仅供学习与个人使用。使用前请自行评估风险；因 QQ 版本升级、系统策略或杀软拦截造成的异常，作者不承担由此产生的责任。请勿用于商业分发或违反腾讯用户协议的场景。
+本项目为非官方第三方工具，仅供学习与个人使用。由于 `version.dll` 代理引导机制容易触发杀毒软件启发式误报，所有源码完全公开并支持通过 GitHub Actions 透明构建；请自行评估风险后使用，勿用于商业分发或违反腾讯用户协议的场景。
